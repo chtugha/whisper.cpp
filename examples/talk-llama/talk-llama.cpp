@@ -1,11 +1,12 @@
 // Talk with AI
 //
 
-#include "common-sdl.h"
 #include "common.h"
 #include "common-whisper.h"
 #include "whisper.h"
 #include "llama.h"
+#include "sip-client.h"
+#include "http-api.h"
 
 #include <chrono>
 #include <cstdio>
@@ -16,6 +17,24 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <unordered_map>
+#include <atomic>
+#include <memory>
+
+// Simple websocket implementation
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <openssl/sha.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
 
 static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
     const llama_model * model = llama_get_model(ctx);
@@ -78,6 +97,8 @@ struct whisper_params {
     bool use_gpu        = true;
     bool flash_attn     = false;
 
+    int32_t http_port = 8081;            // HTTP API server port
+
     std::string person      = "Georgi";
     std::string bot_name    = "LLaMA";
     std::string wake_cmd    = "";
@@ -122,6 +143,7 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (arg == "-vp"  || arg == "--verbose-prompt") { params.verbose_prompt = true; }
         else if (arg == "-ng"  || arg == "--no-gpu")         { params.use_gpu        = false; }
         else if (arg == "-fa"  || arg == "--flash-attn")     { params.flash_attn     = true; }
+        else if (arg == "-hp"  || arg == "--http-port")      { params.http_port = std::stoi(argv[++i]); }
         else if (arg == "-p"   || arg == "--person")         { params.person         = argv[++i]; }
         else if (arg == "-bn"   || arg == "--bot-name")      { params.bot_name       = argv[++i]; }
         else if (arg == "--session")                         { params.path_session   = argv[++i]; }
@@ -176,6 +198,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -vp,      --verbose-prompt [%-7s] print prompt at start\n",                       params.verbose_prompt ? "true" : "false");
     fprintf(stderr, "  -ng,      --no-gpu         [%-7s] disable GPU\n",                                 params.use_gpu ? "false" : "true");
     fprintf(stderr, "  -fa,      --flash-attn     [%-7s] flash attention\n",                             params.flash_attn ? "true" : "false");
+    fprintf(stderr, "  -hp N,    --http-port     [%-7d] HTTP API server port\n",                         params.http_port);
     fprintf(stderr, "  -p NAME,  --person NAME    [%-7s] person name (for prompt selection)\n",          params.person.c_str());
     fprintf(stderr, "  -bn NAME, --bot-name NAME  [%-7s] bot name (to display)\n",                       params.bot_name.c_str());
     fprintf(stderr, "  -w TEXT,  --wake-command T [%-7s] wake-up command to listen for\n",               params.wake_cmd.c_str());
@@ -367,15 +390,24 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "\n");
     }
 
-    // init audio
+    // init SIP client manager and HTTP API server
 
-    audio_async audio(30*1000);
-    if (!audio.init(params.capture_id, WHISPER_SAMPLE_RATE)) {
-        fprintf(stderr, "%s: audio.init() failed!\n", __func__);
+    auto sip_manager = std::make_shared<SipClientManager>();
+    if (!sip_manager->init(ctx_wsp, ctx_llama, params)) {
+        fprintf(stderr, "%s: SIP client manager init failed!\n", __func__);
         return 1;
     }
 
-    audio.resume();
+    HttpApiServer api_server(params.http_port);
+    if (!api_server.init(sip_manager)) {
+        fprintf(stderr, "%s: HTTP API server init failed!\n", __func__);
+        return 1;
+    }
+
+    if (!api_server.start()) {
+        fprintf(stderr, "%s: failed to start HTTP API server!\n", __func__);
+        return 1;
+    }
 
     bool is_running  = true;
     bool force_speak = false;
@@ -561,238 +593,25 @@ int main(int argc, char ** argv) {
         params.person + chat_symb,
     };
 
-    // main loop
-    while (is_running) {
-        // handle Ctrl + C
-        is_running = sdl_poll_events();
+    // main server loop - SIP clients and HTTP API server handle requests
+    printf("%s : AI Phone System running!\n", __func__);
+    printf("%s : HTTP API server on port %d\n", __func__, params.http_port);
+    printf("%s : Web interface: http://localhost:%d\n", __func__, params.http_port);
+    printf("%s : Add SIP clients via the web interface to start receiving calls.\n", __func__);
+    printf("%s : Press Ctrl+C to stop.\n", __func__);
 
-        if (!is_running) {
-            break;
-        }
+    while (is_running && api_server.is_running()) {
+        // Simple server management loop
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
-        // delay
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        int64_t t_ms = 0;
-
-        {
-            audio.get(2000, pcmf32_cur);
-
-            if (::vad_simple(pcmf32_cur, WHISPER_SAMPLE_RATE, 1250, params.vad_thold, params.freq_thold, params.print_energy) || force_speak) {
-                //fprintf(stdout, "%s: Speech detected! Processing ...\n", __func__);
-
-                audio.get(params.voice_ms, pcmf32_cur);
-
-                std::string all_heard;
-
-                if (!force_speak) {
-                    all_heard = ::trim(::transcribe(ctx_wsp, params, pcmf32_cur, prompt_whisper, prob0, t_ms));
-                }
-
-                const auto words = get_words(all_heard);
-
-                std::string wake_cmd_heard;
-                std::string text_heard;
-
-                for (int i = 0; i < (int) words.size(); ++i) {
-                    if (i < wake_cmd_length) {
-                        wake_cmd_heard += words[i] + " ";
-                    } else {
-                        text_heard += words[i] + " ";
-                    }
-                }
-
-                // check if audio starts with the wake-up command if enabled
-                if (use_wake_cmd) {
-                    const float sim = similarity(wake_cmd_heard, wake_cmd);
-
-                    if ((sim < 0.7f) || (text_heard.empty())) {
-                        audio.clear();
-                        continue;
-                    }
-                }
-
-                // optionally give audio feedback that the current text is being processed
-                if (!params.heard_ok.empty()) {
-                    speak_with_file(params.speak, params.heard_ok, params.speak_file, voice_id);
-                }
-
-                // remove text between brackets using regex
-                {
-                    std::regex re("\\[.*?\\]");
-                    text_heard = std::regex_replace(text_heard, re, "");
-                }
-
-                // remove text between brackets using regex
-                {
-                    std::regex re("\\(.*?\\)");
-                    text_heard = std::regex_replace(text_heard, re, "");
-                }
-
-                // remove all characters, except for letters, numbers, punctuation and ':', '\'', '-', ' '
-                text_heard = std::regex_replace(text_heard, std::regex("[^a-zA-Z0-9åäöÅÄÖ\\.,\\?!\\s\\:\\'\\-]"), "");
-
-                // take first line
-                text_heard = text_heard.substr(0, text_heard.find_first_of('\n'));
-
-                // remove leading and trailing whitespace
-                text_heard = std::regex_replace(text_heard, std::regex("^\\s+"), "");
-                text_heard = std::regex_replace(text_heard, std::regex("\\s+$"), "");
-
-                const std::vector<llama_token> tokens = llama_tokenize(ctx_llama, text_heard.c_str(), false);
-
-                if (text_heard.empty() || tokens.empty() || force_speak) {
-                    //fprintf(stdout, "%s: Heard nothing, skipping ...\n", __func__);
-                    audio.clear();
-
-                    continue;
-                }
-
-                force_speak = false;
-
-                text_heard.insert(0, 1, ' ');
-                text_heard += "\n" + params.bot_name + chat_symb;
-                fprintf(stdout, "%s%s%s", "\033[1m", text_heard.c_str(), "\033[0m");
-                fflush(stdout);
-
-                embd = ::llama_tokenize(ctx_llama, text_heard, false);
-
-                // Append the new input tokens to the session_tokens vector
-                if (!path_session.empty()) {
-                    session_tokens.insert(session_tokens.end(), tokens.begin(), tokens.end());
-                }
-
-                // text inference
-                bool done = false;
-                std::string text_to_speak;
-                while (true) {
-                    // predict
-                    if (embd.size() > 0) {
-                        if (n_past + (int) embd.size() > n_ctx) {
-                            n_past = n_keep;
-
-                            // insert n_left/2 tokens at the start of embd from last_n_tokens
-                            embd.insert(embd.begin(), embd_inp.begin() + embd_inp.size() - n_prev, embd_inp.end());
-                            // stop saving session if we run out of context
-                            path_session = "";
-                            //printf("\n---\n");
-                            //printf("resetting: '");
-                            //for (int i = 0; i < (int) embd.size(); i++) {
-                            //    printf("%s", llama_token_to_piece(ctx_llama, embd[i]));
-                            //}
-                            //printf("'\n");
-                            //printf("\n---\n");
-                        }
-
-                        // try to reuse a matching prefix from the loaded session instead of re-eval (via n_past)
-                        // REVIEW
-                        if (n_session_consumed < (int) session_tokens.size()) {
-                            size_t i = 0;
-                            for ( ; i < embd.size(); i++) {
-                                if (embd[i] != session_tokens[n_session_consumed]) {
-                                    session_tokens.resize(n_session_consumed);
-                                    break;
-                                }
-
-                                n_past++;
-                                n_session_consumed++;
-
-                                if (n_session_consumed >= (int) session_tokens.size()) {
-                                    i++;
-                                    break;
-                                }
-                            }
-                            if (i > 0) {
-                                embd.erase(embd.begin(), embd.begin() + i);
-                            }
-                        }
-
-                        if (embd.size() > 0 && !path_session.empty()) {
-                            session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
-                            n_session_consumed = session_tokens.size();
-                        }
-
-                        // prepare batch
-                        {
-                            batch.n_tokens = embd.size();
-
-                            for (int i = 0; i < batch.n_tokens; i++) {
-                                batch.token[i]     = embd[i];
-                                batch.pos[i]       = n_past + i;
-                                batch.n_seq_id[i]  = 1;
-                                batch.seq_id[i][0] = 0;
-                                batch.logits[i]    = i == batch.n_tokens - 1;
-                            }
-                        }
-
-                        if (llama_decode(ctx_llama, batch)) {
-                            fprintf(stderr, "%s : failed to decode\n", __func__);
-                            return 1;
-                        }
-                    }
-
-
-                    embd_inp.insert(embd_inp.end(), embd.begin(), embd.end());
-                    n_past += embd.size();
-
-                    embd.clear();
-
-                    if (done) break;
-
-                    {
-                        // out of user input, sample next token
-
-                        if (!path_session.empty() && need_to_save_session) {
-                            need_to_save_session = false;
-                            llama_state_save_file(ctx_llama, path_session.c_str(), session_tokens.data(), session_tokens.size());
-                        }
-
-                        const llama_token id = llama_sampler_sample(smpl, ctx_llama, -1);
-
-                        if (id != llama_vocab_eos(vocab_llama)) {
-                            // add it to the context
-                            embd.push_back(id);
-
-                            text_to_speak += llama_token_to_piece(ctx_llama, id);
-
-                            printf("%s", llama_token_to_piece(ctx_llama, id).c_str());
-                            fflush(stdout);
-                        }
-                    }
-
-                    {
-                        std::string last_output;
-                        for (int i = embd_inp.size() - 16; i < (int) embd_inp.size(); i++) {
-                            last_output += llama_token_to_piece(ctx_llama, embd_inp[i]);
-                        }
-                        last_output += llama_token_to_piece(ctx_llama, embd[0]);
-
-                        for (std::string & antiprompt : antiprompts) {
-                            if (last_output.find(antiprompt.c_str(), last_output.length() - antiprompt.length(), antiprompt.length()) != std::string::npos) {
-                                done = true;
-                                text_to_speak = ::replace(text_to_speak, antiprompt, "");
-                                fflush(stdout);
-                                need_to_save_session = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    is_running = sdl_poll_events();
-
-                    if (!is_running) {
-                        break;
-                    }
-                }
-
-                speak_with_file(params.speak, text_to_speak, params.speak_file, voice_id);
-
-                audio.clear();
-            }
-        }
+        // Check for Ctrl+C or other termination signals
+        // Note: In a real implementation, you'd want proper signal handling here
     }
 
-    audio.pause();
+    // Cleanup
+    printf("\n%s : Shutting down AI Phone System...\n", __func__);
+    sip_manager->stop_all_clients();
+    api_server.stop();
 
     whisper_print_timings(ctx_wsp);
     whisper_free(ctx_wsp);
