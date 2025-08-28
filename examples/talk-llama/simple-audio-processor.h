@@ -63,6 +63,9 @@ private:
     std::vector<float> convert_g711_ulaw(const std::vector<uint8_t>& data);
     std::vector<float> convert_g711_alaw(const std::vector<uint8_t>& data);
     std::vector<float> convert_pcm16(const std::vector<uint8_t>& data);
+
+    // DTMF handling (RFC 4733)
+    void handle_dtmf_event(const RTPAudioPacket& packet);
     
     // Fast VAD
     bool has_speech(const std::vector<float>& samples);

@@ -153,7 +153,13 @@ void SimpleAudioProcessor::process_audio(const std::string& session_id, const RT
 
 std::vector<float> SimpleAudioProcessor::decode_rtp_audio(const RTPAudioPacket& packet) {
     if (packet.audio_data.empty()) return {};
-    
+
+    // Handle DTMF events (RFC 4733) - payload type 101
+    if (packet.payload_type == 101) {
+        handle_dtmf_event(packet);
+        return {}; // DTMF events don't contain audio samples
+    }
+
     // Fast codec detection and decoding
     switch (packet.payload_type) {
         case 0:  // G.711 μ-law
@@ -288,4 +294,54 @@ std::unique_ptr<AudioProcessor> AudioProcessorFactory::create(ProcessorType type
 
 std::vector<std::string> AudioProcessorFactory::get_available_types() {
     return {"SimpleAudioProcessor", "DebugAudioProcessor"};
+}
+
+void SimpleAudioProcessor::handle_dtmf_event(const RTPAudioPacket& packet) {
+    if (packet.audio_data.size() < 4) {
+        std::cout << "⚠️ Invalid DTMF event packet (too small)" << std::endl;
+        return;
+    }
+
+    // RFC 4733 DTMF Event format:
+    // 0                   1                   2                   3
+    // 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |     event     |E|R| volume    |          duration             |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+    uint8_t event = packet.audio_data[0];
+    uint8_t flags_volume = packet.audio_data[1];
+    uint16_t duration = (packet.audio_data[2] << 8) | packet.audio_data[3];
+
+    bool end_of_event = (flags_volume & 0x80) != 0;
+    bool reserved = (flags_volume & 0x40) != 0;
+    uint8_t volume = flags_volume & 0x3F;
+
+    // Convert event number to DTMF character
+    char dtmf_char = '?';
+    if (event <= 9) {
+        dtmf_char = '0' + event;
+    } else if (event == 10) {
+        dtmf_char = '*';
+    } else if (event == 11) {
+        dtmf_char = '#';
+    } else if (event == 12) {
+        dtmf_char = 'A';
+    } else if (event == 13) {
+        dtmf_char = 'B';
+    } else if (event == 14) {
+        dtmf_char = 'C';
+    } else if (event == 15) {
+        dtmf_char = 'D';
+    }
+
+    std::cout << "📞 DTMF Event: '" << dtmf_char << "' (event=" << (int)event
+              << ", volume=" << (int)volume << ", duration=" << duration
+              << ", end=" << (end_of_event ? "yes" : "no") << ")" << std::endl;
+
+    // TODO: Process DTMF digit for call control or menu navigation
+    // This could be used for:
+    // - Interactive voice response (IVR) menus
+    // - Call transfer requests
+    // - Feature activation (e.g., recording, mute)
 }

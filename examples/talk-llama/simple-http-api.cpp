@@ -170,8 +170,9 @@ std::string SimpleHttpServer::create_response(const HttpResponse& response) {
 }
 
 HttpResponse SimpleHttpServer::handle_request(const HttpRequest& request) {
-    // Only log non-status API requests to reduce spam
-    if (request.path != "/api/status") {
+    // Only log non-polling API requests to reduce spam
+    if (request.path != "/api/status" &&
+        !(request.method == "GET" && request.path == "/api/sip-lines")) {
         std::cout << request.method << " " << request.path << std::endl;
     }
 
@@ -531,8 +532,9 @@ HttpResponse SimpleHttpServer::serve_static_file(const std::string& path) {
 }
 
 HttpResponse SimpleHttpServer::handle_api_request(const HttpRequest& request) {
-    // Only log non-status API requests to reduce spam
-    if (request.path != "/api/status") {
+    // Only log non-polling API requests to reduce spam
+    if (request.path != "/api/status" &&
+        !(request.method == "GET" && request.path == "/api/sip-lines")) {
         std::cout << "API Request: " << request.method << " " << request.path << std::endl;
     }
 

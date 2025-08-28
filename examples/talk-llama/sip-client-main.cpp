@@ -137,6 +137,15 @@ private:
     std::vector<SipLineConfig> sip_lines_;
     std::mutex sip_lines_mutex_;
 
+    // Number format handling (RFC 3966, E.164)
+    std::string extract_phone_number(const std::string& sip_header);
+
+    // REGISTER response forwarding
+    std::mutex register_response_mutex_;
+    std::condition_variable register_response_cv_;
+    std::string pending_register_response_;
+    bool register_response_ready_ = false;
+
     // Main loops
     void sip_management_loop();
     void sip_message_listener();
@@ -344,60 +353,51 @@ bool SimpleSipClient::init_audio_processors() {
     return true; // Always return true - SIP client can run without audio processors
 }
 
-int SimpleSipClient::allocate_dynamic_port() {
-    // Try to find an available port starting from 5061 (5060 is typically reserved for PBX)
-    for (int port = 5061; port <= 5100; port++) {
-        int test_socket = socket(AF_INET, SOCK_DGRAM, 0);
-        if (test_socket < 0) continue;
 
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-
-        if (bind(test_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            close(test_socket);
-            std::cout << "🔌 Allocated dynamic SIP port: " << port << std::endl;
-            return port;
-        }
-        close(test_socket);
-    }
-
-    std::cout << "❌ Failed to allocate dynamic SIP port" << std::endl;
-    return -1;
-}
 
 bool SimpleSipClient::setup_sip_listener() {
     std::cout << "🔧 Setting up SIP listener..." << std::endl;
 
-    // Allocate dynamic port
-    sip_listen_port_ = allocate_dynamic_port();
-    if (sip_listen_port_ < 0) {
-        std::cout << "❌ Failed to allocate dynamic port" << std::endl;
-        return false;
-    }
-    std::cout << "✅ Allocated port: " << sip_listen_port_ << std::endl;
-
-    // Create listening socket
+    // Create listening socket that will be used for both registration and listening
     sip_listen_socket_ = socket(AF_INET, SOCK_DGRAM, 0);
     if (sip_listen_socket_ < 0) {
         std::cout << "❌ Failed to create SIP listening socket: " << strerror(errno) << std::endl;
         return false;
     }
 
-    // Bind to allocated port
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(sip_listen_port_);
-
-    if (bind(sip_listen_socket_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        std::cout << "❌ Failed to bind SIP socket to port " << sip_listen_port_ << ": " << strerror(errno) << std::endl;
+    // Enable SO_REUSEPORT to allow multiple sockets on same port (macOS/BSD)
+    int reuse = 1;
+    if (setsockopt(sip_listen_socket_, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+        std::cout << "❌ Failed to set SO_REUSEPORT on listener: " << strerror(errno) << std::endl;
         close(sip_listen_socket_);
         sip_listen_socket_ = -1;
         return false;
     }
 
+    // Bind to any available port (let OS choose)
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = 0; // Let OS choose port
+
+    if (bind(sip_listen_socket_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cout << "❌ Failed to bind SIP socket: " << strerror(errno) << std::endl;
+        close(sip_listen_socket_);
+        sip_listen_socket_ = -1;
+        return false;
+    }
+
+    // Get the actual port assigned by OS
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(sip_listen_socket_, (struct sockaddr*)&addr, &addr_len) < 0) {
+        std::cout << "❌ Failed to get socket name: " << strerror(errno) << std::endl;
+        close(sip_listen_socket_);
+        sip_listen_socket_ = -1;
+        return false;
+    }
+
+    sip_listen_port_ = ntohs(addr.sin_port);
+    std::cout << "🔌 OS allocated dynamic SIP port: " << sip_listen_port_ << std::endl;
     std::cout << "✅ SIP listener bound to port " << sip_listen_port_ << std::endl;
     return true;
 }
@@ -464,6 +464,26 @@ void SimpleSipClient::sip_listener_loop() {
 
 void SimpleSipClient::handle_sip_message(const std::string& message, const struct sockaddr_in& sender_addr) {
     std::cout << "🔍 Parsing SIP message..." << std::endl;
+
+    // Check if it's a SIP response (starts with "SIP/2.0")
+    if (message.find("SIP/2.0") == 0) {
+        // Check if it's a REGISTER response by looking for CSeq: REGISTER
+        if (message.find("CSeq:") != std::string::npos &&
+            (message.find("REGISTER") != std::string::npos || message.find("register") != std::string::npos)) {
+            std::cout << "📋 REGISTER response - forwarding to registration handler" << std::endl;
+            // Forward this message to any waiting registration function
+            // We'll use a simple approach: store the response for pickup
+            {
+                std::lock_guard<std::mutex> lock(register_response_mutex_);
+                pending_register_response_ = message;
+                register_response_ready_ = true;
+            }
+            register_response_cv_.notify_all();
+            return;
+        }
+        std::cout << "📋 SIP response: " << message.substr(0, message.find('\r')) << std::endl;
+        return;
+    }
 
     // Check if it's an INVITE (incoming call)
     if (message.find("INVITE ") == 0) {
@@ -536,18 +556,9 @@ void SimpleSipClient::handle_invite(const std::string& message, const struct soc
     // Send 200 OK response to accept the call
     send_sip_response(200, "OK", call_id, from, to, via, cseq, sender_addr);
 
-    // Extract caller number from From header for database
-    std::string caller_number = "unknown";
-    size_t sip_pos = from.find("sip:");
-    if (sip_pos != std::string::npos) {
-        size_t start = sip_pos + 4;
-        size_t end = from.find("@", start);
-        if (end != std::string::npos) {
-            caller_number = from.substr(start, end - start);
-        }
-    }
-
-    std::cout << "📞 Extracted caller number: " << caller_number << std::endl;
+    // Extract caller number from From header using RFC-compliant parsing
+    std::string caller_number = extract_phone_number(from);
+    std::cout << "📞 Extracted caller number: " << caller_number << " (from: " << from << ")" << std::endl;
 
     // Create database session for this call
     handle_incoming_call(caller_number);
@@ -569,15 +580,17 @@ void SimpleSipClient::send_sip_response(int code, const std::string& reason, con
     response << "Contact: <sip:whisper@" << local_ip_ << ":" << sip_listen_port_ << ">\r\n";
     response << "Content-Type: application/sdp\r\n";
 
-    // Add SDP for audio (basic G.711 μ-law)
+    // Add SDP for audio with DTMF support (RFC 4733 compliant)
     std::string sdp =
         "v=0\r\n"
         "o=whisper 123456 654321 IN IP4 " + local_ip_ + "\r\n"
         "s=Whisper Talk Session\r\n"
         "c=IN IP4 " + local_ip_ + "\r\n"
         "t=0 0\r\n"
-        "m=audio 8000 RTP/AVP 0\r\n"
-        "a=rtpmap:0 PCMU/8000\r\n";
+        "m=audio 8000 RTP/AVP 0 101\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:101 telephone-event/8000\r\n"
+        "a=fmtp:101 0-15\r\n";
 
     response << "Content-Length: " << sdp.length() << "\r\n";
     response << "\r\n";
@@ -720,6 +733,79 @@ void SimpleSipClient::stop() {
     }
 
     std::cout << "✅ SIP client stopped" << std::endl;
+}
+
+std::string SimpleSipClient::extract_phone_number(const std::string& sip_header) {
+    // Extract phone number from various SIP header formats:
+    // - "Display Name" <sip:+15551234567@domain.com>
+    // - <sip:1001@192.168.1.1>
+    // - sip:+49301234567@starface.local
+    // - tel:+1-555-123-4567
+
+    std::string number;
+
+    // Find the SIP URI or tel URI
+    size_t sip_start = sip_header.find("sip:");
+    size_t tel_start = sip_header.find("tel:");
+
+    if (tel_start != std::string::npos) {
+        // Handle tel: URI format (RFC 3966)
+        size_t start = tel_start + 4;
+        size_t end = sip_header.find_first_of(" \t\r\n>", start);
+        if (end == std::string::npos) end = sip_header.length();
+
+        number = sip_header.substr(start, end - start);
+
+        // Remove tel: URI formatting (hyphens, dots, spaces)
+        std::string clean_number;
+        for (char c : number) {
+            if (std::isdigit(c) || c == '+') {
+                clean_number += c;
+            }
+        }
+        number = clean_number;
+
+    } else if (sip_start != std::string::npos) {
+        // Handle sip: URI format
+        size_t start = sip_start + 4;
+        size_t at_pos = sip_header.find('@', start);
+
+        if (at_pos != std::string::npos) {
+            number = sip_header.substr(start, at_pos - start);
+        }
+    }
+
+    // Clean up the number (remove non-digit characters except +)
+    std::string clean_number;
+    for (char c : number) {
+        if (std::isdigit(c) || c == '+') {
+            clean_number += c;
+        }
+    }
+
+    // Handle various number formats
+    if (clean_number.empty()) {
+        return "unknown";
+    }
+
+    // If it starts with +, it's E.164 international format
+    if (clean_number[0] == '+') {
+        return clean_number;
+    }
+
+    // If it's a short extension (3-4 digits), keep as is
+    if (clean_number.length() <= 4) {
+        return clean_number;
+    }
+
+    // For longer numbers without +, assume it needs country code
+    // This is configurable based on your PBX setup
+    if (clean_number.length() >= 10) {
+        // Assume US/Canada format if 10+ digits without country code
+        return "+" + clean_number;
+    }
+
+    return clean_number;
 }
 
 void SimpleSipClient::handle_incoming_call(const std::string& caller_number) {
@@ -895,12 +981,33 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
         return false;
     }
 
-    std::cout << "🔌 Creating UDP socket for SIP..." << std::endl;
-    int sock = socket(AF_INET, SOCK_DGRAM, 0); // UDP for SIP
+    std::cout << "🔌 Creating UDP socket for SIP registration..." << std::endl;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0); // Create dedicated socket for registration
     if (sock < 0) {
         std::cout << "❌ Failed to create UDP socket: " << strerror(errno) << std::endl;
         return false;
     }
+
+    // Enable SO_REUSEPORT to allow multiple sockets on same port (macOS/BSD)
+    int reuse = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+        std::cout << "❌ Failed to set SO_REUSEPORT: " << strerror(errno) << std::endl;
+        close(sock);
+        return false;
+    }
+
+    // Bind to the same port as our listener so PBX sees consistent source port
+    struct sockaddr_in local_addr;
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port = htons(sip_listen_port_);
+
+    if (bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+        std::cout << "❌ Failed to bind registration socket to port " << sip_listen_port_ << ": " << strerror(errno) << std::endl;
+        close(sock);
+        return false;
+    }
+    std::cout << "✅ Registration socket bound to port " << sip_listen_port_ << std::endl;
     std::cout << "✅ UDP socket created successfully (fd: " << sock << ")" << std::endl;
 
     std::cout << "🌐 Setting up server address..." << std::endl;
@@ -940,11 +1047,11 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
     std::cout << "📝 Creating SIP REGISTER message..." << std::endl;
 
     std::string call_id = "whisper-talk-" + std::to_string(time(nullptr));
-    std::string from_tag = "tag-" + std::to_string(rand() % 10000);
+    std::string from_tag = "tag-" + std::to_string((rand() % 9000) + 1000);
 
     std::ostringstream sip_register;
     sip_register << "REGISTER sip:" << line.server_ip << " SIP/2.0\r\n";
-    sip_register << "Via: SIP/2.0/UDP " << local_ip_ << ":" << sip_listen_port_ << ";branch=z9hG4bK-" << rand() % 10000 << "\r\n";
+    sip_register << "Via: SIP/2.0/UDP " << local_ip_ << ":" << sip_listen_port_ << ";branch=z9hG4bK-" << ((rand() % 9000) + 1000) << "\r\n";
     sip_register << "From: <sip:" << line.username << "@" << line.server_ip << ">;tag=" << from_tag << "\r\n";
     sip_register << "To: <sip:" << line.username << "@" << line.server_ip << ">\r\n";
     sip_register << "Call-ID: " << call_id << "\r\n";
@@ -978,20 +1085,34 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
 
     std::cout << "✅ SIP REGISTER sent successfully (" << sent_bytes << " bytes)" << std::endl;
 
-    // Wait for response
+    // Wait for response from the SIP listener thread
     std::cout << "⏳ Waiting for SIP response..." << std::endl;
-    char response_buffer[4096];
-    struct sockaddr_in response_addr;
-    socklen_t addr_len = sizeof(response_addr);
 
-    // Set receive timeout
-    struct timeval recv_timeout;
-    recv_timeout.tv_sec = 5;  // 5 second timeout
-    recv_timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+    // Clear any previous response
+    {
+        std::lock_guard<std::mutex> lock(register_response_mutex_);
+        register_response_ready_ = false;
+        pending_register_response_.clear();
+    }
 
-    ssize_t received_bytes = recvfrom(sock, response_buffer, sizeof(response_buffer) - 1, 0,
-                                     (struct sockaddr*)&response_addr, &addr_len);
+    // Wait for the listener thread to forward the response
+    std::unique_lock<std::mutex> lock(register_response_mutex_);
+    bool response_received = register_response_cv_.wait_for(lock, std::chrono::seconds(5),
+        [this] { return register_response_ready_; });
+
+    if (!response_received) {
+        std::cout << "❌ No SIP response received (timeout after 5000ms)" << std::endl;
+        std::cout << "   Error: Timeout waiting for REGISTER response" << std::endl;
+        std::cout << "===== SIP REGISTRATION TIMEOUT =====\n" << std::endl;
+        close(sock);
+        return false;
+    }
+
+    std::string response = pending_register_response_;
+    register_response_ready_ = false;
+    lock.unlock();
+
+    ssize_t received_bytes = response.length();
 
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -999,11 +1120,9 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
     close(sock);
 
     if (received_bytes > 0) {
-        response_buffer[received_bytes] = '\0';
         std::cout << "✅ SIP response received (" << received_bytes << " bytes, " << duration.count() << "ms)" << std::endl;
 
-        // Parse response status
-        std::string response(response_buffer);
+        // Response is already available as string from listener thread
         std::cout << "📥 SIP Response:" << std::endl;
 
         // Show first line of response
@@ -1056,8 +1175,7 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
                 // Send authenticated REGISTER with same Call-ID
                 std::cout << "🔐 Sending authenticated REGISTER..." << std::endl;
 
-                // Extract Call-ID from initial request for reuse
-                std::string call_id = "whisper-talk-" + std::to_string(time(nullptr));
+                // Reuse the same Call-ID from initial request (SIP RFC requirement)
                 return send_authenticated_register(line, realm, nonce, supports_qop, call_id);
             } else {
                 std::cout << "❌ SIP registration failed" << std::endl;
@@ -1242,10 +1360,30 @@ bool SimpleSipClient::parse_www_authenticate(const std::string& auth_header, std
 bool SimpleSipClient::send_authenticated_register(const SipLineConfig& line, const std::string& realm, const std::string& nonce, bool supports_qop, const std::string& call_id) {
     std::cout << "\n🔐 ===== SENDING AUTHENTICATED REGISTER =====" << std::endl;
 
-    // Create new socket for authenticated request
+    // Create socket for authenticated request, bound to same port as listener
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         std::cout << "❌ Failed to create UDP socket: " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    // Enable SO_REUSEPORT to allow multiple sockets on same port (macOS/BSD)
+    int reuse = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse)) < 0) {
+        std::cout << "❌ Failed to set SO_REUSEPORT: " << strerror(errno) << std::endl;
+        close(sock);
+        return false;
+    }
+
+    // Bind to the same port as our listener so PBX sees consistent source port
+    struct sockaddr_in local_addr;
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_addr.s_addr = INADDR_ANY;
+    local_addr.sin_port = htons(sip_listen_port_);
+
+    if (bind(sock, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+        std::cout << "❌ Failed to bind auth socket to port " << sip_listen_port_ << ": " << strerror(errno) << std::endl;
+        close(sock);
         return false;
     }
 
@@ -1271,11 +1409,11 @@ bool SimpleSipClient::send_authenticated_register(const SipLineConfig& line, con
 
     // Create authenticated SIP REGISTER message
     std::string actual_call_id = call_id.empty() ? ("whisper-talk-auth-" + std::to_string(time(nullptr))) : call_id;
-    std::string from_tag = "tag-auth-" + std::to_string(rand() % 10000);
+    std::string from_tag = "tag-auth-" + std::to_string((rand() % 9000) + 1000);
 
     std::ostringstream sip_register;
     sip_register << "REGISTER sip:" << line.server_ip << " SIP/2.0\r\n";
-    sip_register << "Via: SIP/2.0/UDP " << local_ip_ << ":" << sip_listen_port_ << ";branch=z9hG4bK-auth-" << rand() % 10000 << "\r\n";
+    sip_register << "Via: SIP/2.0/UDP " << local_ip_ << ":" << sip_listen_port_ << ";branch=z9hG4bK-auth-" << ((rand() % 9000) + 1000) << "\r\n";
     sip_register << "From: <sip:" << line.username << "@" << line.server_ip << ">;tag=" << from_tag << "\r\n";
     sip_register << "To: <sip:" << line.username << "@" << line.server_ip << ">\r\n";
     sip_register << "Call-ID: " << actual_call_id << "\r\n";
@@ -1317,20 +1455,33 @@ bool SimpleSipClient::send_authenticated_register(const SipLineConfig& line, con
 
     std::cout << "✅ Authenticated REGISTER sent (" << sent_bytes << " bytes)" << std::endl;
 
-    // Wait for final response
+    // Wait for final response from the SIP listener thread
     std::cout << "⏳ Waiting for authentication response..." << std::endl;
-    char response_buffer[4096];
-    struct sockaddr_in response_addr;
-    socklen_t addr_len = sizeof(response_addr);
 
-    // Set receive timeout
-    struct timeval recv_timeout;
-    recv_timeout.tv_sec = 5;
-    recv_timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+    // Clear any previous response
+    {
+        std::lock_guard<std::mutex> lock(register_response_mutex_);
+        register_response_ready_ = false;
+        pending_register_response_.clear();
+    }
 
-    ssize_t received_bytes = recvfrom(sock, response_buffer, sizeof(response_buffer) - 1, 0,
-                                     (struct sockaddr*)&response_addr, &addr_len);
+    // Wait for the listener thread to forward the response
+    std::unique_lock<std::mutex> lock(register_response_mutex_);
+    bool response_received = register_response_cv_.wait_for(lock, std::chrono::seconds(5),
+        [this] { return register_response_ready_; });
+
+    if (!response_received) {
+        std::cout << "❌ No authentication response received (timeout after 5000ms)" << std::endl;
+        std::cout << "   Error: Timeout waiting for authenticated REGISTER response" << std::endl;
+        close(sock);
+        return false;
+    }
+
+    std::string response = pending_register_response_;
+    register_response_ready_ = false;
+    lock.unlock();
+
+    ssize_t received_bytes = response.length();
 
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
@@ -1338,8 +1489,7 @@ bool SimpleSipClient::send_authenticated_register(const SipLineConfig& line, con
     close(sock);
 
     if (received_bytes > 0) {
-        response_buffer[received_bytes] = '\0';
-        std::string response(response_buffer);
+        // Response is already available as string from listener thread
 
         std::cout << "✅ Authentication response received (" << received_bytes << " bytes, " << duration.count() << "ms)" << std::endl;
 
