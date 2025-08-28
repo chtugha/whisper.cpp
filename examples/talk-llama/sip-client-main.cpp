@@ -88,19 +88,23 @@ public:
 
     bool init(Database* database, int specific_line_id = -1);
     bool init_audio_processors();
-    bool has_audio_processor(int line_id);
-    void check_and_reconnect_processors();
-    bool is_processor_alive(int line_id);
+
+    // Simple audio routing
+    void register_session_for_audio(const std::string& session_id, int line_id);
+    void unregister_session_for_audio(const std::string& session_id);
+    void route_rtp_to_session(int rtp_port, const RTPAudioPacket& packet);
+
 
     // SIP networking
     bool setup_sip_listener();
     void sip_listener_loop();
     int allocate_dynamic_port();
+    void setup_rtp_listener(int rtp_port);
     bool start();
     void stop();
 
     // Call handling
-    void handle_incoming_call(const std::string& caller_number);
+    void handle_incoming_call(const std::string& caller_number, const std::string& call_id = "");
     void end_call(const std::string& session_id);
 
     // Audio streaming
@@ -117,6 +121,12 @@ private:
     // Per-line audio processors (simple)
     std::unordered_map<int, std::unique_ptr<AudioProcessorService>> line_audio_processors_;
     std::mutex processors_mutex_;
+
+    // Simple audio routing
+    std::unordered_map<std::string, int> session_to_line_; // session_id -> line_id
+    std::unordered_map<int, std::string> rtp_port_to_session_; // rtp_port -> session_id
+    std::unordered_map<std::string, int> call_id_to_rtp_port_; // call_id -> rtp_port (temporary)
+    std::mutex audio_routing_mutex_;
 
     // SIP networking
     int sip_listen_socket_;
@@ -170,6 +180,8 @@ private:
     // Incoming call handling
     void handle_sip_message(const std::string& message, const struct sockaddr_in& sender_addr);
     void handle_invite(const std::string& message, const struct sockaddr_in& sender_addr);
+    void handle_ack(const std::string& message, const struct sockaddr_in& sender_addr);
+    void handle_bye(const std::string& message, const struct sockaddr_in& sender_addr);
     void send_sip_response(int code, const std::string& reason, const std::string& call_id, const std::string& from, const std::string& to, const std::string& via, int cseq, const struct sockaddr_in& dest_addr);
 
 
@@ -402,6 +414,117 @@ bool SimpleSipClient::setup_sip_listener() {
     return true;
 }
 
+int SimpleSipClient::allocate_dynamic_port() {
+    // Use standard RTP port range (10000-20000, even numbers only)
+    static int rtp_port_counter = 10000;
+
+    for (int attempts = 0; attempts < 100; attempts++) {
+        int candidate_port = rtp_port_counter;
+        rtp_port_counter += 2; // RTP uses even ports, RTCP uses odd ports
+
+        if (rtp_port_counter > 20000) {
+            rtp_port_counter = 10000; // Wrap around
+        }
+
+        // Test if port is available
+        int test_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (test_sock < 0) continue;
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(candidate_port);
+
+        if (bind(test_sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            close(test_sock);
+            std::cout << "🎯 Allocated standard RTP port: " << candidate_port << std::endl;
+            return candidate_port;
+        }
+
+        close(test_sock);
+    }
+
+    std::cout << "⚠️ Failed to allocate RTP port, using fallback 10000" << std::endl;
+    return 10000; // Fallback to standard RTP port
+}
+
+void SimpleSipClient::setup_rtp_listener(int rtp_port) {
+    // Create a basic UDP socket to listen on the RTP port
+    // This makes the port "active" so the PBX can send audio to it
+    int rtp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (rtp_sock < 0) {
+        std::cout << "⚠️ Failed to create RTP socket for port " << rtp_port << std::endl;
+        return;
+    }
+
+    struct sockaddr_in rtp_addr;
+    memset(&rtp_addr, 0, sizeof(rtp_addr));
+    rtp_addr.sin_family = AF_INET;
+    rtp_addr.sin_addr.s_addr = INADDR_ANY;
+    rtp_addr.sin_port = htons(rtp_port);
+
+    if (bind(rtp_sock, (struct sockaddr*)&rtp_addr, sizeof(rtp_addr)) < 0) {
+        std::cout << "⚠️ Failed to bind RTP socket to port " << rtp_port << std::endl;
+        close(rtp_sock);
+        return;
+    }
+
+    // Keep the socket open and start RTP processing thread
+    std::cout << "✅ RTP port " << rtp_port << " is ready for media (socket kept open)" << std::endl;
+
+    // Start a simple RTP receiver thread for this port
+    std::thread rtp_thread([this, rtp_sock, rtp_port]() {
+        char buffer[2048];
+        struct sockaddr_in sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+
+        std::cout << "🎧 RTP receiver thread started for port " << rtp_port << std::endl;
+
+        int packet_count = 0;
+        while (running_) {
+            ssize_t received = recvfrom(rtp_sock, buffer, sizeof(buffer), 0,
+                                      (struct sockaddr*)&sender_addr, &sender_len);
+            if (received > 0) {
+                packet_count++;
+
+                // Log first packet and then every 100th packet to avoid spam
+                if (packet_count == 1) {
+                    std::cout << "🎧 RTP audio stream started: " << received << " bytes from "
+                             << inet_ntoa(sender_addr.sin_addr) << ":" << ntohs(sender_addr.sin_port) << std::endl;
+                } else if (packet_count % 100 == 0) {
+                    std::cout << "🎵 RTP: " << packet_count << " packets received" << std::endl;
+                }
+
+                // Parse RTP packet and route to existing audio system
+                if (received >= 12) { // Minimum RTP header size
+                    uint8_t* rtp_data = (uint8_t*)buffer;
+
+                    // Parse RTP header
+                    uint8_t payload_type = rtp_data[1] & 0x7F;
+                    uint16_t sequence = (rtp_data[2] << 8) | rtp_data[3];
+                    uint32_t timestamp = (rtp_data[4] << 24) | (rtp_data[5] << 16) |
+                                       (rtp_data[6] << 8) | rtp_data[7];
+
+                    // Extract audio payload (skip 12-byte RTP header)
+                    std::vector<uint8_t> audio_payload(rtp_data + 12, rtp_data + received);
+
+                    // Create RTPAudioPacket for existing routing system
+                    RTPAudioPacket packet(payload_type, audio_payload, timestamp, sequence);
+
+                    // Route through existing audio system (finds session by port)
+                    route_rtp_to_session(rtp_port, packet);
+                }
+            }
+        }
+
+        close(rtp_sock);
+        std::cout << "🔌 RTP receiver thread ended for port " << rtp_port << std::endl;
+    });
+
+    rtp_thread.detach(); // Let it run independently
+}
+
 void SimpleSipClient::sip_listener_loop() {
     std::cout << "👂 SIP LISTENER THREAD STARTED!" << std::endl;
     std::cout << "👂 Starting SIP listener on port " << sip_listen_port_ << std::endl;
@@ -493,12 +616,12 @@ void SimpleSipClient::handle_sip_message(const std::string& message, const struc
     // Check if it's a BYE (call termination)
     else if (message.find("BYE ") == 0) {
         std::cout << "📞 Call termination (BYE) received" << std::endl;
-        // TODO: Handle BYE message
+        handle_bye(message, sender_addr);
     }
     // Check if it's an ACK
     else if (message.find("ACK ") == 0) {
         std::cout << "✅ ACK received - call established" << std::endl;
-        // TODO: Handle ACK message
+        handle_ack(message, sender_addr);
     }
     // Other SIP messages
     else {
@@ -553,6 +676,13 @@ void SimpleSipClient::handle_invite(const std::string& message, const struct soc
     std::cout << "   To: " << to << std::endl;
     std::cout << "   CSeq: " << cseq << std::endl;
 
+    // Send 180 Ringing first (proper SIP call progression)
+    std::cout << "📞 Sending 180 Ringing..." << std::endl;
+    send_sip_response(180, "Ringing", call_id, from, to, via, cseq, sender_addr);
+
+    // Wait a moment to simulate ringing
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
     // Send 200 OK response to accept the call
     send_sip_response(200, "OK", call_id, from, to, via, cseq, sender_addr);
 
@@ -561,7 +691,7 @@ void SimpleSipClient::handle_invite(const std::string& message, const struct soc
     std::cout << "📞 Extracted caller number: " << caller_number << " (from: " << from << ")" << std::endl;
 
     // Create database session for this call
-    handle_incoming_call(caller_number);
+    handle_incoming_call(caller_number, call_id);
 }
 
 void SimpleSipClient::send_sip_response(int code, const std::string& reason, const std::string& call_id,
@@ -578,25 +708,54 @@ void SimpleSipClient::send_sip_response(int code, const std::string& reason, con
     response << "Call-ID: " << call_id << "\r\n";
     response << "CSeq: " << cseq << " INVITE\r\n";
     response << "Contact: <sip:whisper@" << local_ip_ << ":" << sip_listen_port_ << ">\r\n";
-    response << "Content-Type: application/sdp\r\n";
 
-    // Add SDP for audio with DTMF support (RFC 4733 compliant)
-    std::string sdp =
-        "v=0\r\n"
-        "o=whisper 123456 654321 IN IP4 " + local_ip_ + "\r\n"
-        "s=Whisper Talk Session\r\n"
-        "c=IN IP4 " + local_ip_ + "\r\n"
-        "t=0 0\r\n"
-        "m=audio 8000 RTP/AVP 0 101\r\n"
-        "a=rtpmap:0 PCMU/8000\r\n"
-        "a=rtpmap:101 telephone-event/8000\r\n"
-        "a=fmtp:101 0-15\r\n";
+    // Only add SDP and allocate RTP port for 200 OK responses
+    if (code == 200) {
+        response << "Content-Type: application/sdp\r\n";
 
-    response << "Content-Length: " << sdp.length() << "\r\n";
-    response << "\r\n";
-    response << sdp;
+        // Allocate dynamic RTP port for this call
+        int rtp_port = allocate_dynamic_port();
+        std::cout << "🎵 Allocated RTP port: " << rtp_port << " for call" << std::endl;
+
+        // Set up RTP listener on the allocated port (basic UDP socket)
+        setup_rtp_listener(rtp_port);
+        std::cout << "🎧 RTP listener set up on port " << rtp_port << std::endl;
+
+        // Store RTP port for this call_id (will be connected to session later)
+        {
+            std::lock_guard<std::mutex> lock(audio_routing_mutex_);
+            call_id_to_rtp_port_[call_id] = rtp_port;
+        }
+
+        // Add SDP for audio with DTMF support (RFC 4733 compliant)
+        std::string sdp =
+            "v=0\r\n"
+            "o=whisper 123456 654321 IN IP4 " + local_ip_ + "\r\n"
+            "s=Whisper Talk Session\r\n"
+            "c=IN IP4 " + local_ip_ + "\r\n"
+            "t=0 0\r\n"
+            "m=audio " + std::to_string(rtp_port) + " RTP/AVP 0 101\r\n"
+            "a=rtpmap:0 PCMU/8000\r\n"
+            "a=rtpmap:101 telephone-event/8000\r\n"
+            "a=fmtp:101 0-15\r\n"
+            "a=sendrecv\r\n";
+
+        response << "Content-Length: " << sdp.length() << "\r\n";
+        response << "\r\n";
+        response << sdp;
+    } else {
+        // For non-200 responses (like 180 Ringing), no SDP
+        response << "Content-Length: 0\r\n";
+        response << "\r\n";
+    }
 
     std::string response_str = response.str();
+
+    // Debug: Show exactly what we're sending
+    std::cout << "🔍 SIP Response being sent:" << std::endl;
+    std::cout << "---BEGIN SIP RESPONSE---" << std::endl;
+    std::cout << response_str << std::endl;
+    std::cout << "---END SIP RESPONSE---" << std::endl;
 
     // Send response
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -616,63 +775,65 @@ void SimpleSipClient::send_sip_response(int code, const std::string& reason, con
     }
 }
 
-bool SimpleSipClient::has_audio_processor(int line_id) {
-    std::lock_guard<std::mutex> lock(processors_mutex_);
-    return line_audio_processors_.find(line_id) != line_audio_processors_.end();
-}
+void SimpleSipClient::handle_bye(const std::string& message, const struct sockaddr_in& sender_addr) {
+    std::cout << "📞 Processing BYE message..." << std::endl;
 
-bool SimpleSipClient::is_processor_alive(int line_id) {
-    std::lock_guard<std::mutex> lock(processors_mutex_);
-    auto it = line_audio_processors_.find(line_id);
-    if (it == line_audio_processors_.end()) {
-        return false;
-    }
+    // Parse key SIP headers from BYE message
+    std::string call_id, from, to, via;
+    int cseq = 0;
 
-    try {
-        // Quick health check - if this throws, processor is dead
-        auto status = it->second->get_status();
-        return status.is_running;
-    } catch (...) {
-        // Processor crashed or disconnected
-        std::cout << "💀 Audio processor for line " << line_id << " appears to be dead" << std::endl;
-        return false;
-    }
-}
-
-void SimpleSipClient::check_and_reconnect_processors() {
-    if (!database_) return;
-
-    auto sip_lines = database_->get_all_sip_lines();
-
-    for (const auto& line : sip_lines) {
-        if (!line.enabled) continue;
-
-        std::lock_guard<std::mutex> lock(processors_mutex_);
-        auto it = line_audio_processors_.find(line.line_id);
-
-        if (it == line_audio_processors_.end()) {
-            // No processor for this line - try to create one
-            try {
-                auto audio_processor = AudioProcessorServiceFactory::create();
-                audio_processor->set_database(database_);
-
-                if (audio_processor->start(8083 + line.line_id)) {
-                    line_audio_processors_[line.line_id] = std::move(audio_processor);
-                    std::cout << "🔄 Reconnected audio processor for SIP line " << line.line_id << std::endl;
-                }
-            } catch (...) {
-                // Failed to reconnect - will try again later
-            }
-        } else {
-            // Check if existing processor is still alive
-            if (!is_processor_alive(line.line_id)) {
-                // Remove dead processor
-                line_audio_processors_.erase(it);
-                std::cout << "🗑️ Removed dead audio processor for line " << line.line_id << std::endl;
-            }
+    std::istringstream iss(message);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("Call-ID:") == 0) {
+            call_id = line.substr(9);
+            call_id.erase(0, call_id.find_first_not_of(" \t"));
+            call_id.erase(call_id.find_last_not_of(" \t\r\n") + 1);
+        } else if (line.find("From:") == 0) {
+            from = line.substr(5);
+            from.erase(0, from.find_first_not_of(" \t"));
+            from.erase(from.find_last_not_of(" \t\r\n") + 1);
+        } else if (line.find("To:") == 0) {
+            to = line.substr(3);
+            to.erase(0, to.find_first_not_of(" \t"));
+            to.erase(to.find_last_not_of(" \t\r\n") + 1);
+        } else if (line.find("Via:") == 0) {
+            via = line.substr(4);
+            via.erase(0, via.find_first_not_of(" \t"));
+            via.erase(via.find_last_not_of(" \t\r\n") + 1);
+        } else if (line.find("CSeq:") == 0) {
+            std::string cseq_line = line.substr(5);
+            cseq_line.erase(0, cseq_line.find_first_not_of(" \t"));
+            cseq = std::stoi(cseq_line);
         }
     }
+
+    // Send 200 OK response to BYE
+    send_sip_response(200, "OK", call_id, from, to, via, cseq, sender_addr);
+
+    // Find and end the call session using Call-ID
+    std::string session_to_end;
+    {
+        std::lock_guard<std::mutex> lock(calls_mutex_);
+        for (const auto& [session_id, call_session] : active_calls_) {
+            // Match by Call-ID or other criteria
+            // For now, end the most recent active call
+            session_to_end = session_id;
+            break;
+        }
+    }
+
+    if (!session_to_end.empty()) {
+        std::cout << "🔚 Ending call session: " << session_to_end << std::endl;
+        end_call(session_to_end);
+    } else {
+        std::cout << "⚠️ No active call found to end for BYE message" << std::endl;
+    }
 }
+
+
+
+
 
 bool SimpleSipClient::start() {
     std::cout << "🚀 SimpleSipClient::start() called" << std::endl;
@@ -808,40 +969,47 @@ std::string SimpleSipClient::extract_phone_number(const std::string& sip_header)
     return clean_number;
 }
 
-void SimpleSipClient::handle_incoming_call(const std::string& caller_number) {
+void SimpleSipClient::handle_incoming_call(const std::string& caller_number, const std::string& call_id) {
     std::cout << "📞 Incoming call from: " << caller_number << std::endl;
 
+    if (!database_) {
+        std::cerr << "❌ No database connection available" << std::endl;
+        return;
+    }
+
     // Step 1: Get or create caller in database
+    std::cout << "🔍 Looking up caller in database: " << caller_number << std::endl;
     int caller_id = database_->get_or_create_caller(caller_number);
     if (caller_id < 0) {
-        std::cerr << "❌ Failed to create caller record" << std::endl;
+        std::cerr << "❌ Failed to create caller record for: " << caller_number << std::endl;
         return;
     }
+    std::cout << "✅ Caller ID: " << caller_id << std::endl;
 
     // Step 2: Create new session
+    std::cout << "🔄 Creating database session for caller_id: " << caller_id << std::endl;
     std::string session_id = database_->create_session(caller_id, caller_number);
     if (session_id.empty()) {
-        std::cerr << "❌ Failed to create session" << std::endl;
+        std::cerr << "❌ Failed to create session for caller_id: " << caller_id << std::endl;
         return;
     }
+    std::cout << "✅ Created session: " << session_id << std::endl;
 
-    // Step 2.5: Activate audio processor for this line (if available)
-    int line_id = (specific_line_id_ != -1) ? specific_line_id_ : 1; // Default to line 1
-    {
-        std::lock_guard<std::mutex> lock(processors_mutex_);
-        auto it = line_audio_processors_.find(line_id);
-        if (it != line_audio_processors_.end()) {
-            try {
-                AudioSessionParams params(session_id, caller_number, line_id);
-                it->second->create_session(params);
-                std::cout << "🎵 Activated audio processor for line " << line_id << ", session " << session_id << std::endl;
-            } catch (...) {
-                std::cout << "💥 Failed to activate audio processor for line " << line_id << " - removing" << std::endl;
-                line_audio_processors_.erase(it);
-            }
+    // Register for audio routing
+    int line_id = (specific_line_id_ != -1) ? specific_line_id_ : 1;
+    register_session_for_audio(session_id, line_id);
+
+    // Register RTP port to session mapping using call_id
+    if (!call_id.empty()) {
+        std::lock_guard<std::mutex> lock(audio_routing_mutex_);
+        auto rtp_it = call_id_to_rtp_port_.find(call_id);
+        if (rtp_it != call_id_to_rtp_port_.end()) {
+            int rtp_port = rtp_it->second;
+            rtp_port_to_session_[rtp_port] = session_id;
+            call_id_to_rtp_port_.erase(rtp_it); // Clean up temporary mapping
+            std::cout << "🎵 Registered RTP port " << rtp_port << " → session " << session_id << std::endl;
         }
     }
-    // If no processor, audio will be silently dropped
 
     // Step 3: Assign unique port for this caller
     int caller_port = get_caller_port(caller_id);
@@ -860,6 +1028,8 @@ void SimpleSipClient::handle_incoming_call(const std::string& caller_number) {
         std::lock_guard<std::mutex> lock(calls_mutex_);
         active_calls_[session_id] = call_session;
     }
+
+
 
     std::cout << "📱 Call answered automatically. Session active on port " << caller_port << std::endl;
     std::cout << "🎤 Ready to receive audio for session: " << session_id << " (port: " << caller_port << ")" << std::endl;
@@ -894,6 +1064,9 @@ void SimpleSipClient::end_call(const std::string& session_id) {
         }
     }
 
+    // Unregister from audio routing
+    unregister_session_for_audio(session_id);
+
     {
         std::lock_guard<std::mutex> lock(calls_mutex_);
         auto it = active_calls_.find(session_id);
@@ -907,33 +1080,25 @@ void SimpleSipClient::end_call(const std::string& session_id) {
 }
 
 void SimpleSipClient::process_rtp_audio(const std::string& session_id, const RTPAudioPacket& packet) {
-    // Fast path: get line_id with minimal locking
+    // Get line_id for this session
     int line_id = -1;
     {
-        std::lock_guard<std::mutex> calls_lock(calls_mutex_);
-        auto call_it = active_calls_.find(session_id);
-        if (call_it == active_calls_.end()) {
-            return; // Silently drop audio for unknown sessions
+        std::lock_guard<std::mutex> lock(audio_routing_mutex_);
+        auto it = session_to_line_.find(session_id);
+        if (it == session_to_line_.end()) {
+            return; // Session not registered, drop audio
         }
-        line_id = call_it->second.internal_port; // Using internal_port as line_id
+        line_id = it->second;
     }
 
-    // Fast path: process audio with crash protection
+    // Try to send to processor, drop if not available
     {
-        std::lock_guard<std::mutex> proc_lock(processors_mutex_);
+        std::lock_guard<std::mutex> lock(processors_mutex_);
         auto proc_it = line_audio_processors_.find(line_id);
         if (proc_it != line_audio_processors_.end()) {
-            try {
-                // Send RTP packet directly to processor (fastest path)
-                proc_it->second->process_audio(session_id, packet);
-            } catch (...) {
-                // Processor crashed - remove it and drop audio
-                std::cout << "💥 Audio processor crashed for line " << line_id << " - removing" << std::endl;
-                line_audio_processors_.erase(proc_it);
-            }
+            proc_it->second->process_audio(session_id, packet);
         }
     }
-    // If no processor, silently drop audio
 }
 
 void SimpleSipClient::stream_audio_from_piper(const std::string& session_id, const std::vector<uint8_t>& audio_data) {
@@ -1204,16 +1369,9 @@ void SimpleSipClient::update_line_status(int line_id, const std::string& status)
 void SimpleSipClient::sip_management_loop() {
     std::cout << "📞 Starting SIP management loop (ready for real calls)..." << std::endl;
 
-    int reconnect_counter = 0;
     while (running_) {
         // Fast loop for real-time SIP processing
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-        // Check for processor reconnections every 5 seconds (100 * 50ms)
-        if (++reconnect_counter >= 100) {
-            check_and_reconnect_processors();
-            reconnect_counter = 0;
-        }
 
         if (!running_) break;
     }
@@ -1551,4 +1709,68 @@ std::string SimpleSipClient::create_digest_response_with_qop(const std::string& 
     return response;
 }
 
+// Simple audio routing methods
+void SimpleSipClient::register_session_for_audio(const std::string& session_id, int line_id) {
+    std::lock_guard<std::mutex> lock(audio_routing_mutex_);
+    session_to_line_[session_id] = line_id;
+}
 
+void SimpleSipClient::unregister_session_for_audio(const std::string& session_id) {
+    std::lock_guard<std::mutex> lock(audio_routing_mutex_);
+    session_to_line_.erase(session_id);
+
+    // Also remove from RTP port mapping
+    for (auto it = rtp_port_to_session_.begin(); it != rtp_port_to_session_.end(); ++it) {
+        if (it->second == session_id) {
+            rtp_port_to_session_.erase(it);
+            break;
+        }
+    }
+}
+
+void SimpleSipClient::route_rtp_to_session(int rtp_port, const RTPAudioPacket& packet) {
+    std::string session_id;
+
+    // Find session_id for this RTP port
+    {
+        std::lock_guard<std::mutex> lock(audio_routing_mutex_);
+        auto it = rtp_port_to_session_.find(rtp_port);
+        if (it == rtp_port_to_session_.end()) {
+            return; // No session for this port, drop audio
+        }
+        session_id = it->second;
+    }
+
+    // Route to existing audio processing system
+    process_rtp_audio(session_id, packet);
+}
+
+void SimpleSipClient::handle_ack(const std::string& message, const struct sockaddr_in& sender_addr) {
+    std::cout << "📞 Processing ACK message - call fully established" << std::endl;
+
+    // Find the most recent active session and mark it as established
+    std::lock_guard<std::mutex> lock(calls_mutex_);
+    for (auto& [session_id, call_session] : active_calls_) {
+        if (call_session.status == "active") {
+            call_session.status = "established";
+            std::cout << "🎉 Call session " << session_id << " fully established!" << std::endl;
+
+            // Now tell the audio processor to join the session
+            int line_id = (specific_line_id_ != -1) ? specific_line_id_ : 1;
+            {
+                std::lock_guard<std::mutex> proc_lock(processors_mutex_);
+                auto proc_it = line_audio_processors_.find(line_id);
+                if (proc_it != line_audio_processors_.end()) {
+                    try {
+                        AudioSessionParams params(session_id, call_session.phone_number, line_id);
+                        proc_it->second->create_session(params);
+                        std::cout << "🎵 Audio processor joined session " << session_id << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cout << "⚠️ Failed to join audio processor to session: " << e.what() << std::endl;
+                    }
+                }
+            }
+            break; // Only handle the first active session
+        }
+    }
+}
