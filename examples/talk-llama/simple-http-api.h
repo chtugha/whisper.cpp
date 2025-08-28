@@ -78,6 +78,9 @@ private:
     HttpResponse api_whisper_models(const HttpRequest& request);
     HttpResponse api_whisper_load_model(const HttpRequest& request);
     HttpResponse api_whisper_upload_model(const HttpRequest& request);
+    HttpResponse api_whisper_start(const HttpRequest& request);
+    HttpResponse api_whisper_stop(const HttpRequest& request);
+    HttpResponse api_whisper_transcribe(const HttpRequest& request);
     
     std::string get_mime_type(const std::string& extension);
 

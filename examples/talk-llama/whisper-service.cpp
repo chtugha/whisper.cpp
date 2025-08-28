@@ -6,12 +6,14 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
 
 namespace fs = std::filesystem;
 
-WhisperService::WhisperService() 
-    : whisper_ctx_(nullptr), running_(false), database_(nullptr),
-      default_language_("en"), models_directory_("./models"),
+WhisperService::WhisperService()
+    : whisper_ctx_(nullptr), running_(false), loading_(false), database_(nullptr),
+      default_language_("en"), models_directory_("./models"), last_chosen_model_(""),
       total_processed_audio_(0) {
     
     // Create models directory if it doesn't exist
@@ -53,11 +55,7 @@ void WhisperService::stop() {
         cleanup_thread_.join();
     }
     
-    // Stop audio processor
-    if (audio_processor_) {
-        audio_processor_->stop();
-        audio_processor_.reset();
-    }
+    // Audio processing removed - handled by external AudioProcessorService
     
     // Clear all sessions
     {
@@ -70,7 +68,10 @@ void WhisperService::stop() {
 
 bool WhisperService::load_model(const std::string& model_path, const std::string& model_name) {
     std::lock_guard<std::mutex> lock(whisper_mutex_);
-    
+
+    loading_.store(true);
+    std::cout << "🎤 Loading Whisper model: " << model_path << std::endl;
+
     if (!fs::exists(model_path)) {
         std::cout << "❌ Model file not found: " << model_path << std::endl;
         return false;
@@ -91,6 +92,7 @@ bool WhisperService::load_model(const std::string& model_path, const std::string
     whisper_ctx_ = whisper_init_from_file_with_params(model_path.c_str(), cparams);
     
     if (!whisper_ctx_) {
+        loading_.store(false);
         std::cout << "❌ Failed to load Whisper model: " << model_path << std::endl;
         return false;
     }
@@ -98,28 +100,10 @@ bool WhisperService::load_model(const std::string& model_path, const std::string
     current_model_path_ = model_path;
     current_model_name_ = model_name.empty() ? fs::path(model_path).filename().string() : model_name;
     
-    // Initialize audio processor with new model
-    if (audio_processor_) {
-        audio_processor_->stop();
-    }
+    // WhisperService is now a pure transcription service
+    // Audio processing (chunking, VAD) is handled by AudioProcessorService
     
-    auto whisper_stt = std::make_unique<WhisperServiceSTT>(this);
-    audio_processor_ = std::make_unique<AudioStreamProcessor>(whisper_stt.release());
-    
-    // Set transcription callback
-    audio_processor_->set_transcription_callback([this](const std::string& session_id, const std::string& text) {
-        on_transcription_ready(session_id, text);
-    });
-    
-    // Configure for phone calls
-    audio_processor_->set_min_chunk_duration_ms(1000);
-    audio_processor_->set_max_chunk_duration_ms(8000);
-    
-    if (!audio_processor_->start()) {
-        std::cout << "❌ Failed to start audio processor" << std::endl;
-        return false;
-    }
-    
+    loading_.store(false);
     std::cout << "✅ Whisper model loaded successfully: " << current_model_name_ << std::endl;
     return true;
 }
@@ -127,10 +111,7 @@ bool WhisperService::load_model(const std::string& model_path, const std::string
 void WhisperService::unload_model() {
     std::lock_guard<std::mutex> lock(whisper_mutex_);
     
-    if (audio_processor_) {
-        audio_processor_->stop();
-        audio_processor_.reset();
-    }
+    // Audio processing removed - handled by external AudioProcessorService
     
     if (whisper_ctx_) {
         whisper_free(whisper_ctx_);
@@ -186,21 +167,130 @@ bool WhisperService::has_session(const std::string& session_id) {
     return sessions_.find(session_id) != sessions_.end();
 }
 
-void WhisperService::add_audio(const std::string& session_id, const std::vector<float>& audio_samples) {
-    if (!audio_processor_ || audio_samples.empty()) return;
-    
-    // Update session activity
+std::string WhisperService::transcribe_chunk(const std::string& session_id, const std::vector<float>& audio_chunk) {
+    if (!whisper_ctx_ || audio_chunk.empty()) return "";
+
+    // Validate chunk size (Whisper expects 16kHz, 1-30 seconds)
+    const size_t min_samples = 16000;      // 1 second at 16kHz
+    const size_t max_samples = 480000;     // 30 seconds at 16kHz
+
+    if (audio_chunk.size() < min_samples || audio_chunk.size() > max_samples) {
+        std::cout << "⚠️  Invalid chunk size: " << audio_chunk.size()
+                  << " samples (expected " << min_samples << "-" << max_samples << ")" << std::endl;
+        return "";
+    }
+
+    // Verify session exists in database
+    if (!database_) {
+        std::cout << "❌ No database connection for session: " << session_id << std::endl;
+        return "";
+    }
+
+    CallSession db_session = database_->get_session(session_id);
+    if (db_session.session_id.empty()) {
+        std::cout << "❌ Session not found in database: " << session_id << std::endl;
+        return "";
+    }
+
+    // Get or create session state for this database session
+    struct whisper_state* session_state = nullptr;
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
         auto it = sessions_.find(session_id);
         if (it != sessions_.end()) {
+            session_state = it->second->state;
             it->second->last_activity = std::chrono::steady_clock::now();
+        } else {
+            // Create new session state for existing database session
+            if (init_session(session_id)) {
+                auto new_it = sessions_.find(session_id);
+                if (new_it != sessions_.end()) {
+                    session_state = new_it->second->state;
+                }
+            }
         }
     }
-    
-    // Send to audio processor
-    audio_processor_->add_audio(session_id, audio_samples);
-    total_processed_audio_.fetch_add(audio_samples.size());
+
+    if (!session_state) {
+        std::cout << "❌ Failed to get session state for: " << session_id << std::endl;
+        return "";
+    }
+
+    // Transcribe with session isolation
+    std::lock_guard<std::mutex> lock(whisper_mutex_);
+
+    // Configure for phone calls with sentence separation
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_progress = false;
+    wparams.print_special = false;
+    wparams.print_realtime = false;
+    wparams.print_timestamps = false;
+    wparams.translate = false;
+    wparams.no_context = false;        // Enable context for better sentences
+    wparams.single_segment = false;    // Allow multiple segments
+    wparams.max_tokens = 64;           // Allow complete sentences
+    wparams.language = default_language_.c_str();
+    wparams.n_threads = 4;
+
+    // Enable sentence-level segmentation for better LLaMA input
+    wparams.split_on_word = true;
+    wparams.max_len = 1;               // Split into sentences
+
+    // Process with session state
+    if (whisper_full_with_state(whisper_ctx_, session_state, wparams,
+                                audio_chunk.data(), audio_chunk.size()) != 0) {
+        return "";
+    }
+
+    // Extract transcription with sentence separation
+    std::string result;
+    const int n_segments = whisper_full_n_segments_from_state(session_state);
+
+    for (int i = 0; i < n_segments; i++) {
+        const char* text = whisper_full_get_segment_text_from_state(session_state, i);
+        if (text && strlen(text) > 0) {
+            std::string segment_text = text;
+
+            // Clean up whitespace
+            if (!segment_text.empty() && segment_text[0] == ' ') {
+                segment_text = segment_text.substr(1);
+            }
+
+            if (!segment_text.empty()) {
+                if (!result.empty()) result += " ";
+                result += segment_text;
+
+                // Add sentence boundary for LLaMA
+                if (segment_text.back() == '.' || segment_text.back() == '!' || segment_text.back() == '?') {
+                    result += "\n";
+                }
+            }
+        }
+    }
+
+    total_processed_audio_.fetch_add(audio_chunk.size());
+
+    // Accumulate transcription in database session
+    if (database_ && !result.empty()) {
+        // Get current whisper_data from database
+        CallSession current_session = database_->get_session(session_id);
+        std::string accumulated_text = current_session.whisper_data;
+
+        // Append new transcription
+        if (!accumulated_text.empty()) {
+            accumulated_text += " ";
+        }
+        accumulated_text += result;
+
+        // Update database with accumulated text
+        database_->update_session_whisper(session_id, accumulated_text);
+
+        std::cout << "📝 Accumulated transcription for session " << session_id
+                  << ": \"" << result << "\"" << std::endl;
+        std::cout << "💾 Total whisper_data length: " << accumulated_text.length() << " chars" << std::endl;
+    }
+
+    return result;
 }
 
 std::vector<WhisperModel> WhisperService::get_available_models() {
@@ -275,13 +365,27 @@ void WhisperService::cleanup_inactive_sessions() {
 
 void WhisperService::on_transcription_ready(const std::string& session_id, const std::string& text) {
     std::cout << "📝 Transcription ready for session " << session_id << ": \"" << text << "\"" << std::endl;
-    
-    // Update database if available
-    if (database_) {
-        database_->update_session_whisper(session_id, text);
+
+    // Accumulate text in database session (same logic as transcribe_chunk)
+    if (database_ && !text.empty()) {
+        // Get current whisper_data from database
+        CallSession current_session = database_->get_session(session_id);
+        std::string accumulated_text = current_session.whisper_data;
+
+        // Append new transcription
+        if (!accumulated_text.empty()) {
+            accumulated_text += " ";
+        }
+        accumulated_text += text;
+
+        // Update database with accumulated text
+        database_->update_session_whisper(session_id, accumulated_text);
+
+        std::cout << "💾 Updated accumulated whisper_data for session " << session_id
+                  << " (total: " << accumulated_text.length() << " chars)" << std::endl;
     }
-    
-    // Update session context
+
+    // Update internal session context for Whisper state continuity
     std::lock_guard<std::mutex> lock(sessions_mutex_);
     auto it = sessions_.find(session_id);
     if (it != sessions_.end()) {
@@ -293,6 +397,7 @@ WhisperService::ServiceStatus WhisperService::get_status() {
     ServiceStatus status;
     status.is_running = running_.load();
     status.model_loaded = (whisper_ctx_ != nullptr);
+    status.is_loading = loading_.load();
     status.model_name = current_model_name_;
     status.model_language = default_language_;
     status.total_processed_audio = total_processed_audio_.load();
@@ -302,8 +407,142 @@ WhisperService::ServiceStatus WhisperService::get_status() {
         status.active_sessions = sessions_.size();
     }
     
+    // Add memory information
+    status.available_memory_mb = get_available_memory_mb();
+    if (!current_model_path_.empty()) {
+        status.required_memory_mb = estimate_model_memory_mb(current_model_path_);
+        status.memory_sufficient = status.available_memory_mb >= status.required_memory_mb;
+
+        if (status.memory_sufficient) {
+            status.memory_status = "Sufficient memory available";
+        } else {
+            status.memory_status = "Insufficient memory for current model";
+        }
+    } else {
+        status.required_memory_mb = 0;
+        status.memory_sufficient = true;
+        status.memory_status = "No model loaded";
+    }
+
     return status;
 }
+
+// Memory management methods
+size_t WhisperService::get_available_memory_mb() const {
+    vm_statistics64_data_t vm_stat;
+    mach_msg_type_number_t host_size = sizeof(vm_stat) / sizeof(natural_t);
+
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm_stat, &host_size) != KERN_SUCCESS) {
+        return 0;
+    }
+
+    // Get page size
+    vm_size_t page_size;
+    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS) {
+        page_size = 4096; // Default page size
+    }
+
+    // Calculate free memory in MB
+    uint64_t free_memory = (vm_stat.free_count + vm_stat.inactive_count) * page_size;
+    return free_memory / (1024 * 1024);
+}
+
+size_t WhisperService::estimate_model_memory_mb(const std::string& model_path) const {
+    if (!fs::exists(model_path)) {
+        return 0;
+    }
+
+    // Get file size
+    size_t file_size = fs::file_size(model_path);
+    size_t file_size_mb = file_size / (1024 * 1024);
+
+    // Estimate memory usage based on model type and size
+    // Whisper models typically need 2-3x their file size in memory
+    // Plus additional buffers for processing
+    size_t estimated_memory = file_size_mb * 3 + 500; // 3x file size + 500MB buffer
+
+    // Adjust based on model name patterns
+    std::string filename = fs::path(model_path).filename().string();
+    if (filename.find("tiny") != std::string::npos) {
+        estimated_memory = file_size_mb * 2 + 200; // Smaller models are more efficient
+    } else if (filename.find("large") != std::string::npos) {
+        estimated_memory = file_size_mb * 3 + 800; // Large models need more overhead
+    } else if (filename.find("q5_0") != std::string::npos || filename.find("q4_0") != std::string::npos) {
+        estimated_memory = file_size_mb * 2 + 300; // Quantized models are more efficient
+    }
+
+    return estimated_memory;
+}
+
+bool WhisperService::check_memory_sufficient(const std::string& model_path) const {
+    size_t available = get_available_memory_mb();
+    size_t required = estimate_model_memory_mb(model_path);
+
+    std::cout << "🧠 Memory check for " << fs::path(model_path).filename().string() << ":" << std::endl;
+    std::cout << "   Available: " << available << " MB" << std::endl;
+    std::cout << "   Required:  " << required << " MB" << std::endl;
+
+    return available >= required;
+}
+
+std::string WhisperService::find_best_model_for_memory() const {
+    std::vector<std::string> model_candidates = {
+        "models/ggml-tiny.en.bin",
+        "models/ggml-tiny.bin",
+        "models/ggml-base.en.bin",
+        "models/ggml-base.bin",
+        "models/ggml-small.en.bin",
+        "models/ggml-small.bin",
+        "models/ggml-medium.en.bin",
+        "models/ggml-medium.bin",
+        "models/ggml-large-v3-q5_0.bin",
+        "models/ggml-large-v3.bin"
+    };
+
+    // Try models from smallest to largest
+    for (const auto& model : model_candidates) {
+        if (fs::exists(model) && check_memory_sufficient(model)) {
+            std::cout << "✅ Found suitable model: " << fs::path(model).filename().string() << std::endl;
+            return model;
+        }
+    }
+
+    std::cout << "❌ No suitable model found for available memory" << std::endl;
+    return "";
+}
+
+bool WhisperService::load_model_with_memory_check(const std::string& model_path, const std::string& model_name) {
+    std::cout << "🧠 Loading model with memory check: " << model_path << std::endl;
+
+    // Check if specific model has enough memory
+    if (check_memory_sufficient(model_path)) {
+        if (load_model(model_path, model_name)) {
+            last_chosen_model_ = model_path;
+            return true;
+        }
+    }
+
+    // If not enough memory or loading failed, find best alternative
+    std::cout << "⚠️  Insufficient memory or failed to load requested model" << std::endl;
+    std::cout << "🔍 Searching for alternative model..." << std::endl;
+
+    std::string best_model = find_best_model_for_memory();
+    if (!best_model.empty() && best_model != model_path) {
+        std::string best_name = fs::path(best_model).filename().string();
+        best_name = best_name.substr(0, best_name.find_last_of("."));
+
+        std::cout << "🔄 Attempting to load alternative: " << best_name << std::endl;
+        if (load_model(best_model, best_name)) {
+            last_chosen_model_ = best_model;
+            return true;
+        }
+    }
+
+    std::cout << "❌ No suitable model could be loaded" << std::endl;
+    return false;
+}
+
+
 
 // WhisperServiceSTT Implementation
 WhisperServiceSTT::WhisperServiceSTT(WhisperService* service) 

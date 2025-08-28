@@ -8,6 +8,8 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include "jitter-buffer.h"
+#include "rtp-packet.h"
 
 // Background mechanism for routing chunks to Whisper service
 class WhisperConnector {
@@ -22,7 +24,8 @@ public:
     
     // Audio chunk routing
     void send_chunk(const std::string& session_id, const std::vector<float>& audio_chunk);
-    
+    std::string transcribe_chunk(const std::string& session_id, const std::vector<float>& audio_chunk);
+
     // Connection monitoring callback
     void set_connection_callback(std::function<void(bool)> callback) { connection_callback_ = callback; }
     
@@ -85,8 +88,16 @@ private:
     
     // SIP client connection
     std::function<void(const std::string&, const std::vector<uint8_t>&)> sip_callback_;
-    
+
+    // Jitter buffer for smooth outgoing audio
+    std::unique_ptr<RTPPacketBuffer> outgoing_jitter_buffer_;
+
+    // RFC 3550 compliant RTP session for TTS audio
+    std::unique_ptr<RTPSession> rtp_session_;
+
     // Background mechanisms
     void worker_loop();
+    void process_jitter_buffer();
     std::vector<uint8_t> convert_to_g711_rtp(const std::vector<uint8_t>& piper_audio);
+    RTPPacket create_rtp_packet_from_audio(const std::vector<uint8_t>& audio_data);
 };

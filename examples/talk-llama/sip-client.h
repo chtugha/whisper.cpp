@@ -5,6 +5,8 @@
 #include "tts-engine.h"
 #include "common-whisper.h"
 #include "database.h"
+#include "jitter-buffer.h"
+#include "rtp-packet.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -110,9 +112,19 @@ struct SipCallSession {
     int n_past;
     bool need_to_save_session;
     
-    // Audio processing
+    // Audio processing with jitter buffers
     AudioBuffer incoming_audio;
     AudioBuffer outgoing_audio;
+
+    // Jitter buffers for stable RTP processing
+    TimedRTPBuffer incoming_rtp_buffer;  // Incoming RTP packets
+    RTPPacketBuffer outgoing_rtp_buffer; // Outgoing RTP packets
+
+    // RFC 3550 compliant RTP session management
+    std::unique_ptr<RTPSession> rtp_session;
+
+    // Internal session data (NEVER transmitted)
+    InternalSessionData internal_data;
     
     // Call state
     std::atomic<bool> is_active{false};
@@ -194,9 +206,22 @@ private:
     void process_audio_for_call(std::shared_ptr<SipCallSession> session);
     
     // Audio processing
-    void process_incoming_audio(std::shared_ptr<SipCallSession> session, 
+    void process_incoming_audio(std::shared_ptr<SipCallSession> session,
                                const std::vector<float>& audio_data);
     std::vector<float> generate_tts_audio(const std::string& text);
+
+    // RTP jitter buffer processing
+    void handle_incoming_rtp(std::shared_ptr<SipCallSession> session,
+                            const std::vector<uint8_t>& rtp_data,
+                            uint32_t sequence_number, uint32_t timestamp);
+    void handle_outgoing_audio_with_jitter_buffer(std::shared_ptr<SipCallSession> session,
+                                                  const std::vector<uint8_t>& audio_data);
+
+    // RFC 3550 compliant RTP transmission
+    void send_rtp_packet_to_network(std::shared_ptr<SipCallSession> session,
+                                   const std::vector<uint8_t>& rtp_packet);
+    void process_incoming_rtp_packet(std::shared_ptr<SipCallSession> session,
+                                   const std::vector<uint8_t>& raw_packet);
 };
 
 // SIP client manager - manages multiple SIP clients

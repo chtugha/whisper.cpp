@@ -1,5 +1,6 @@
 #include "simple-http-api.h"
 #include "database.h"
+#include "whisper-service.h"
 #include <iostream>
 #include <sstream>
 #include <fstream>
@@ -307,7 +308,7 @@ HttpResponse SimpleHttpServer::serve_static_file(const std::string& path) {
                             <input type="text" id="displayName" name="displayName" placeholder="AI Assistant Line">
                         </div>
                     </div>
-                    <button type="submit" class="refresh-btn">Add SIP Line</button>
+                    <button type="button" class="refresh-btn" onclick="addSipLine()">Add SIP Line</button>
                 </form>
             </div>
 
@@ -366,8 +367,64 @@ HttpResponse SimpleHttpServer::serve_static_file(const std::string& path) {
         // Load SIP lines on page load
         loadSipLines();
 
-        // Setup form handler
-        document.getElementById('sipLineForm').addEventListener('submit', handleSipLineForm);
+        // Simple function to add SIP line
+        window.addSipLine = function() {
+            console.log('=== ADD SIP LINE FUNCTION CALLED ===');
+
+            const serverIp = document.getElementById('serverIp').value;
+            const serverPort = document.getElementById('serverPort').value;
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const extension = document.getElementById('extension').value;
+            const displayName = document.getElementById('displayName').value;
+
+            console.log('Form values:', {
+                serverIp, serverPort, username, password, extension, displayName
+            });
+
+            if (!username) {
+                alert('Username is required!');
+                return;
+            }
+
+            const sipLineData = {
+                server_ip: serverIp || '192.168.1.100',
+                server_port: parseInt(serverPort) || 5060,
+                username: username,
+                password: password,
+                extension: extension || username,
+                display_name: displayName || `AI Assistant ${username}`
+            };
+
+            console.log('Sending data:', sipLineData);
+
+            fetch('/api/sip-lines', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(sipLineData)
+            })
+            .then(response => {
+                console.log('Response status:', response.status);
+                return response.text();
+            })
+            .then(data => {
+                console.log('Response data:', data);
+                alert('SIP line added successfully!');
+                // Clear form
+                document.getElementById('username').value = '';
+                document.getElementById('password').value = '';
+                document.getElementById('extension').value = '';
+                document.getElementById('displayName').value = '';
+                // Refresh list
+                loadSipLines();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                alert('Error adding SIP line: ' + error.message);
+            });
+        };
 
         // Auto-refresh every 5 seconds
         setInterval(refreshStatus, 5000);
@@ -430,52 +487,7 @@ HttpResponse SimpleHttpServer::serve_static_file(const std::string& path) {
             container.innerHTML = html;
         }
 
-        async function handleSipLineForm(event) {
-            event.preventDefault();
-            console.log('Form submitted!');
-
-            const formData = new FormData(event.target);
-
-            // Debug: log all form data
-            console.log('Form data:');
-            for (let [key, value] of formData.entries()) {
-                console.log(`  ${key}: ${value}`);
-            }
-
-            const sipLineData = {
-                server_ip: formData.get('serverIp'),
-                server_port: parseInt(formData.get('serverPort')),
-                username: formData.get('username'),
-                password: formData.get('password'),
-                extension: formData.get('extension') || formData.get('username'),
-                display_name: formData.get('displayName') || `AI Assistant ${formData.get('username')}`
-            };
-
-            console.log('SIP line data:', sipLineData);
-
-            try {
-                const response = await fetch('/api/sip-lines', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(sipLineData)
-                });
-
-                if (response.ok) {
-                    // Clear form
-                    event.target.reset();
-                    // Set default values back
-                    document.getElementById('serverIp').value = '192.168.1.100';
-                    document.getElementById('serverPort').value = '5060';
-                    // Refresh the list
-                    loadSipLines();
-                } else {
-                    alert('Failed to add SIP line');
-                }
-            } catch (error) {
-                console.error('Failed to add SIP line:', error);
-                alert('Failed to add SIP line');
-            }
-        }
+        // Old form handler removed - using simple addSipLine function instead
 
         async function toggleSipLine(lineId) {
             try {
@@ -580,6 +592,41 @@ HttpResponse SimpleHttpServer::handle_api_request(const HttpRequest& request) {
         std::cout << "Matched sessions endpoint" << std::endl;
         if (request.method == "GET") {
             return api_sessions_get(request);
+        }
+    } else if (request.path == "/api/whisper/status") {
+        std::cout << "Matched whisper status endpoint" << std::endl;
+        if (request.method == "GET") {
+            return api_whisper_status(request);
+        }
+    } else if (request.path == "/api/whisper/models") {
+        std::cout << "Matched whisper models endpoint" << std::endl;
+        if (request.method == "GET") {
+            return api_whisper_models(request);
+        }
+    } else if (request.path == "/api/whisper/load-model") {
+        std::cout << "Matched whisper load model endpoint" << std::endl;
+        if (request.method == "POST") {
+            return api_whisper_load_model(request);
+        }
+    } else if (request.path == "/api/whisper/upload-model") {
+        std::cout << "Matched whisper upload model endpoint" << std::endl;
+        if (request.method == "POST") {
+            return api_whisper_upload_model(request);
+        }
+    } else if (request.path == "/api/whisper/start") {
+        std::cout << "Matched whisper start endpoint" << std::endl;
+        if (request.method == "POST") {
+            return api_whisper_start(request);
+        }
+    } else if (request.path == "/api/whisper/stop") {
+        std::cout << "Matched whisper stop endpoint" << std::endl;
+        if (request.method == "POST") {
+            return api_whisper_stop(request);
+        }
+    } else if (request.path == "/api/whisper/transcribe") {
+        std::cout << "Matched whisper transcribe endpoint" << std::endl;
+        if (request.method == "POST") {
+            return api_whisper_transcribe(request);
         }
     }
 
@@ -1003,5 +1050,354 @@ HttpResponse SimpleHttpServer::api_sessions_get(const HttpRequest& request) {
     response.status_text = "OK";
     response.body = json.str();
 
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_status(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    // Check if Whisper service is available
+    bool service_available = (whisper_service_ != nullptr);
+    bool service_running = false;
+    std::string current_model = "none";
+    int active_sessions = 0;
+
+    if (service_available && whisper_service_) {
+        auto status = whisper_service_->get_status();
+        service_running = status.is_running;
+        current_model = status.model_loaded ? status.model_name : "none";
+        active_sessions = status.active_sessions;
+
+        // Include loading status and memory information in response
+        response.body = "{"
+                       "\"service_available\": " + std::string(service_available ? "true" : "false") + ","
+                       "\"service_running\": " + std::string(service_running ? "true" : "false") + ","
+                       "\"model_loaded\": " + std::string(status.model_loaded ? "true" : "false") + ","
+                       "\"is_loading\": " + std::string(status.is_loading ? "true" : "false") + ","
+                       "\"current_model\": \"" + current_model + "\","
+                       "\"active_sessions\": " + std::to_string(active_sessions) + ","
+                       "\"available_memory_mb\": " + std::to_string(status.available_memory_mb) + ","
+                       "\"required_memory_mb\": " + std::to_string(status.required_memory_mb) + ","
+                       "\"memory_sufficient\": " + std::string(status.memory_sufficient ? "true" : "false") + ","
+                       "\"memory_status\": \"" + status.memory_status + "\","
+                       "\"endpoint\": \"http://localhost:8082\""
+                       "}";
+        return response;
+    }
+
+    response.status_code = 200;
+    response.status_text = "OK";
+
+    // Default response for when service is not available
+    if (!service_available) {
+        response.body = "{"
+                       "\"service_available\": false,"
+                       "\"service_running\": false,"
+                       "\"model_loaded\": false,"
+                       "\"is_loading\": false,"
+                       "\"current_model\": \"none\","
+                       "\"active_sessions\": 0,"
+                       "\"available_memory_mb\": 0,"
+                       "\"required_memory_mb\": 0,"
+                       "\"memory_sufficient\": false,"
+                       "\"memory_status\": \"Service not available\","
+                       "\"endpoint\": \"http://localhost:8082\""
+                       "}";
+    }
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_models(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!whisper_service_) {
+        response.status_code = 503;
+        response.status_text = "Service Unavailable";
+        response.body = "{\"error\": \"Whisper service not available\"}";
+        return response;
+    }
+
+    // Get available models from WhisperService
+    auto models = whisper_service_->get_available_models();
+    std::string current_model = whisper_service_->get_loaded_model_name();
+
+    std::ostringstream json;
+    json << "{\"models\":[";
+
+    bool first = true;
+    for (const auto& model : models) {
+        if (!first) json << ",";
+        first = false;
+
+        json << "{"
+             << "\"name\":\"" << model.name << "\","
+             << "\"file\":\"" << model.path << "\","
+             << "\"language\":\"" << model.language << "\","
+             << "\"available\":" << (model.is_loaded ? "true" : "false") << ","
+             << "\"file_size\":" << model.file_size << ","
+             << "\"upload_date\":\"" << model.upload_date << "\","
+             << "\"is_current\":" << (model.name == current_model ? "true" : "false")
+             << "}";
+    }
+
+    json << "],"
+         << "\"current_model\":\"" << current_model << "\""
+         << "}";
+
+    response.status_code = 200;
+    response.status_text = "OK";
+    response.body = json.str();
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_load_model(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!whisper_service_) {
+        response.status_code = 503;
+        response.status_text = "Service Unavailable";
+        response.body = "{\"error\": \"Whisper service not available\"}";
+        return response;
+    }
+
+    // Parse model name from request body (JSON: {"model": "base.en"})
+    std::string model_name = "base.en"; // Default
+
+    // Simple JSON parsing for model name
+    size_t model_pos = request.body.find("\"model\"");
+    if (model_pos != std::string::npos) {
+        size_t colon_pos = request.body.find(":", model_pos);
+        if (colon_pos != std::string::npos) {
+            size_t quote_start = request.body.find("\"", colon_pos);
+            if (quote_start != std::string::npos) {
+                quote_start++;
+                size_t quote_end = request.body.find("\"", quote_start);
+                if (quote_end != std::string::npos) {
+                    model_name = request.body.substr(quote_start, quote_end - quote_start);
+                }
+            }
+        }
+    }
+
+    std::cout << "🎤 Loading Whisper model with memory check: " << model_name << std::endl;
+
+    // Check if model file exists and load it with memory awareness
+    std::string model_file = "models/ggml-" + model_name + ".bin";
+    bool success = whisper_service_->load_model_with_memory_check(model_file, model_name);
+
+    // Get current status for memory information
+    auto status = whisper_service_->get_status();
+
+    if (success) {
+        response.status_code = 200;
+        response.status_text = "OK";
+        response.body = "{"
+                       "\"success\": true,"
+                       "\"message\": \"Model loaded successfully\","
+                       "\"model\": \"" + whisper_service_->get_loaded_model_name() + "\","
+                       "\"file\": \"" + model_file + "\","
+                       "\"available_memory_mb\": " + std::to_string(status.available_memory_mb) + ","
+                       "\"required_memory_mb\": " + std::to_string(status.required_memory_mb) + ","
+                       "\"memory_sufficient\": " + std::string(status.memory_sufficient ? "true" : "false") + ","
+                       "\"memory_status\": \"" + status.memory_status + "\""
+                       "}";
+        std::cout << "✅ Whisper model loaded: " << whisper_service_->get_loaded_model_name() << std::endl;
+    } else {
+        response.status_code = 400;
+        response.status_text = "Bad Request";
+        response.body = "{"
+                       "\"error\": \"Failed to load model - insufficient memory or model not found\","
+                       "\"model\": \"" + model_name + "\","
+                       "\"file\": \"" + model_file + "\","
+                       "\"available_memory_mb\": " + std::to_string(status.available_memory_mb) + ","
+                       "\"memory_status\": \"" + status.memory_status + "\""
+                       "}";
+        std::cout << "❌ Failed to load Whisper model: " << model_name << std::endl;
+    }
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_upload_model(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    // This is a simplified implementation for model upload
+    // In a real implementation, you'd need to parse multipart/form-data
+
+    // For now, return a placeholder response
+    response.status_code = 501;
+    response.status_text = "Not Implemented";
+    response.body = "{"
+                   "\"error\": \"Model upload not yet implemented\","
+                   "\"message\": \"Please manually place model files in the models/ directory\","
+                   "\"supported_formats\": [\"ggml-*.bin\"],"
+                   "\"models_directory\": \"models/\""
+                   "}";
+
+    // TODO: Implement multipart form data parsing for file upload
+    // 1. Parse Content-Type: multipart/form-data boundary
+    // 2. Extract file data from request body
+    // 3. Validate file format (should be .bin file)
+    // 4. Save to models/ directory with proper naming
+    // 5. Verify model integrity
+
+    std::cout << "📤 Model upload requested (not yet implemented)" << std::endl;
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_start(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!whisper_service_) {
+        response.status_code = 503;
+        response.status_text = "Service Unavailable";
+        response.body = "{\"error\": \"Whisper service not available\"}";
+        return response;
+    }
+
+    if (whisper_service_->is_running()) {
+        response.status_code = 200;
+        response.status_text = "OK";
+        response.body = "{\"success\": true, \"message\": \"Whisper service is already running\"}";
+        return response;
+    }
+
+    std::cout << "🚀 Starting Whisper service..." << std::endl;
+    bool success = whisper_service_->start();
+
+    if (success) {
+        response.status_code = 200;
+        response.status_text = "OK";
+        response.body = "{\"success\": true, \"message\": \"Whisper service started successfully\"}";
+        std::cout << "✅ Whisper service started" << std::endl;
+    } else {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = "{\"error\": \"Failed to start Whisper service\"}";
+        std::cout << "❌ Failed to start Whisper service" << std::endl;
+    }
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_stop(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!whisper_service_) {
+        response.status_code = 503;
+        response.status_text = "Service Unavailable";
+        response.body = "{\"error\": \"Whisper service not available\"}";
+        return response;
+    }
+
+    if (!whisper_service_->is_running()) {
+        response.status_code = 200;
+        response.status_text = "OK";
+        response.body = "{\"success\": true, \"message\": \"Whisper service is already stopped\"}";
+        return response;
+    }
+
+    std::cout << "🛑 Stopping Whisper service..." << std::endl;
+    whisper_service_->stop();
+
+    response.status_code = 200;
+    response.status_text = "OK";
+    response.body = "{\"success\": true, \"message\": \"Whisper service stopped successfully\"}";
+    std::cout << "✅ Whisper service stopped" << std::endl;
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_whisper_transcribe(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!whisper_service_) {
+        response.status_code = 503;
+        response.status_text = "Service Unavailable";
+        response.body = "{\"error\": \"Whisper service not available\"}";
+        return response;
+    }
+
+    if (!whisper_service_->is_model_loaded()) {
+        response.status_code = 503;
+        response.status_text = "Service Unavailable";
+        response.body = "{\"error\": \"No Whisper model loaded\"}";
+        return response;
+    }
+
+    // Get session ID from headers
+    std::string session_id = "default";
+    auto session_header = request.headers.find("X-Session-ID");
+    if (session_header != request.headers.end()) {
+        session_id = session_header->second;
+    }
+
+    // Ensure session exists
+    if (!whisper_service_->has_session(session_id)) {
+        if (!whisper_service_->init_session(session_id)) {
+            response.status_code = 500;
+            response.status_text = "Internal Server Error";
+            response.body = "{\"error\": \"Failed to initialize session\"}";
+            return response;
+        }
+    }
+
+    // Parse WAV audio data from request body
+    if (request.body.empty()) {
+        response.status_code = 400;
+        response.status_text = "Bad Request";
+        response.body = "{\"error\": \"No audio data provided\"}";
+        return response;
+    }
+
+    // Convert WAV data to float samples (simplified - assumes 16kHz mono WAV)
+    std::vector<float> audio_samples;
+
+    // Skip WAV header (44 bytes) and convert 16-bit PCM to float
+    if (request.body.size() > 44) {
+        const uint8_t* pcm_data = reinterpret_cast<const uint8_t*>(request.body.data() + 44);
+        size_t pcm_size = request.body.size() - 44;
+
+        audio_samples.reserve(pcm_size / 2);
+        for (size_t i = 0; i < pcm_size; i += 2) {
+            int16_t sample = static_cast<int16_t>(pcm_data[i] | (pcm_data[i + 1] << 8));
+            audio_samples.push_back(static_cast<float>(sample) / 32768.0f);
+        }
+    }
+
+    if (audio_samples.empty()) {
+        response.status_code = 400;
+        response.status_text = "Bad Request";
+        response.body = "{\"error\": \"Invalid audio data\"}";
+        return response;
+    }
+
+    std::cout << "🎤 Transcribing " << audio_samples.size() << " samples for session: " << session_id << std::endl;
+
+    // Transcribe using WhisperService
+    std::string transcription = whisper_service_->transcribe_chunk(session_id, audio_samples);
+
+    if (transcription.empty()) {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = "{\"error\": \"Transcription failed\"}";
+        return response;
+    }
+
+    response.status_code = 200;
+    response.status_text = "OK";
+    response.body = transcription;  // Return plain text transcription
+
+    std::cout << "✅ Transcription completed: \"" << transcription << "\"" << std::endl;
     return response;
 }

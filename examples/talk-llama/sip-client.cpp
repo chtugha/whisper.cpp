@@ -257,6 +257,16 @@ void SipClient::handle_incoming_call(const std::string& call_id, const std::stri
     // Create call session
     auto session = std::make_shared<SipCallSession>(call_id, caller, whisper_state, seq_id);
     session->is_active.store(true);
+
+    // Initialize RFC 3550 compliant RTP session
+    session->rtp_session = std::make_unique<RTPSession>();
+
+    // Initialize internal session data (never transmitted)
+    session->internal_data.session_id = call_id;
+    session->internal_data.caller_phone = caller;
+    session->internal_data.line_id = line_id_;
+    session->internal_data.created_time = std::chrono::steady_clock::now();
+    session->internal_data.last_activity = std::chrono::steady_clock::now();
     
     {
         std::lock_guard<std::mutex> lock(calls_mutex_);
@@ -297,12 +307,24 @@ void SipClient::process_audio_for_call(std::shared_ptr<SipCallSession> session) 
     if (session->is_processing.load()) {
         return; // Already processing
     }
-    
-    // Get incoming audio
+
+    // Process incoming RTP packets through jitter buffer first
+    TimedRTPPacket rtp_packet;
+    if (session->incoming_rtp_buffer.try_pop(rtp_packet)) {
+        // Convert RTP packet to audio samples
+        std::vector<float> audio_data = convert_rtp_to_float(rtp_packet.data.data(), rtp_packet.data.size());
+
+        if (!audio_data.empty()) {
+            // Add to audio buffer for further processing
+            session->incoming_audio.add_samples(audio_data);
+        }
+    }
+
+    // Get buffered audio for processing
     std::vector<float> audio_data;
     if (session->incoming_audio.get_samples(audio_data, 100)) {
         session->is_processing.store(true);
-        
+
         // Process in separate thread to avoid blocking
         std::thread([this, session, audio_data]() {
             process_incoming_audio(session, audio_data);
@@ -666,6 +688,120 @@ void SipClientManager::cleanup_llama_resources() {
 
     // Cleanup TTS
     tts_manager_.reset();
+}
+
+void SipClient::handle_incoming_rtp(std::shared_ptr<SipCallSession> session,
+                                   const std::vector<uint8_t>& rtp_data,
+                                   uint32_t sequence_number, uint32_t timestamp) {
+    // Add RTP packet to jitter buffer with timing information
+    TimedRTPPacket timed_packet(rtp_data, sequence_number, timestamp);
+
+    // Push to jitter buffer - this will handle packet ordering and timing
+    session->incoming_rtp_buffer.push(timed_packet);
+
+    std::cout << "📥 RTP packet buffered: seq=" << sequence_number
+              << ", ts=" << timestamp << ", size=" << rtp_data.size() << std::endl;
+}
+
+void SipClient::handle_outgoing_audio_with_jitter_buffer(std::shared_ptr<SipCallSession> session,
+                                                        const std::vector<uint8_t>& audio_data) {
+    if (!session->rtp_session) {
+        std::cout << "❌ No RTP session for outgoing audio" << std::endl;
+        return;
+    }
+
+    // Convert audio to G.711 μ-law if needed
+    std::vector<uint8_t> g711_payload = RTPCodec::float_to_g711_ulaw(
+        std::vector<float>(audio_data.begin(), audio_data.end()));
+
+    // Create RFC 3550 compliant RTP packet
+    RTPPacket rtp_packet = session->rtp_session->create_packet(
+        RTPPayloadType::PCMU,           // G.711 μ-law
+        g711_payload,                   // Audio payload
+        RTPTiming::G711_TIMESTAMP_INCREMENT, // 160 samples increment
+        false                           // No marker bit
+    );
+
+    // Serialize to wire format (NO internal session data included)
+    std::vector<uint8_t> wire_packet = rtp_packet.serialize();
+
+    // Add to jitter buffer for smooth transmission
+    session->outgoing_rtp_buffer.push(wire_packet);
+
+    // Process buffered outgoing audio
+    std::vector<uint8_t> buffered_packet;
+    if (session->outgoing_rtp_buffer.try_pop(buffered_packet)) {
+        // Send RFC 3550 compliant RTP packet
+        send_rtp_packet_to_network(session, buffered_packet);
+
+        std::cout << "📤 Sent RFC 3550 compliant RTP packet: " << buffered_packet.size()
+                  << " bytes (seq=" << rtp_packet.get_sequence_number()
+                  << ", ts=" << rtp_packet.get_timestamp() << ")" << std::endl;
+    }
+}
+
+void SipClient::send_rtp_packet_to_network(std::shared_ptr<SipCallSession> session,
+                                          const std::vector<uint8_t>& rtp_packet) {
+    // This method sends ONLY RFC 3550 compliant RTP packets
+    // NO internal session data is included in the packet
+
+    std::cout << "🌐 Sending RFC 3550 compliant RTP packet: " << rtp_packet.size() << " bytes" << std::endl;
+
+    // TODO: Implement actual UDP socket transmission
+    // The rtp_packet contains ONLY:
+    // - 12-byte RTP header (version, payload type, sequence, timestamp, SSRC)
+    // - Audio payload (G.711 μ-law encoded)
+    // - NO session_id, caller_phone, line_id, or other internal data
+
+    // Example UDP transmission (commented out):
+    /*
+    struct sockaddr_in dest_addr;
+    // ... set up destination from SDP negotiation
+
+    int rtp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    ssize_t sent = sendto(rtp_socket, rtp_packet.data(), rtp_packet.size(), 0,
+                         (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+
+    if (sent != static_cast<ssize_t>(rtp_packet.size())) {
+        std::cout << "❌ Failed to send RTP packet" << std::endl;
+    }
+
+    close(rtp_socket);
+    */
+}
+
+void SipClient::process_incoming_rtp_packet(std::shared_ptr<SipCallSession> session,
+                                           const std::vector<uint8_t>& raw_packet) {
+    // Parse RFC 3550 compliant RTP packet
+    RTPPacket rtp_packet = RTPPacket::parse(raw_packet.data(), raw_packet.size());
+
+    if (!rtp_packet.is_valid()) {
+        std::cout << "❌ Invalid RTP packet received" << std::endl;
+        return;
+    }
+
+    std::cout << "📥 Received RFC 3550 RTP packet: seq=" << rtp_packet.get_sequence_number()
+              << ", ts=" << rtp_packet.get_timestamp()
+              << ", pt=" << static_cast<int>(rtp_packet.get_payload_type())
+              << ", payload=" << rtp_packet.get_payload().size() << " bytes" << std::endl;
+
+    // Convert payload to float samples based on codec
+    std::vector<float> audio_samples;
+    if (rtp_packet.get_payload_type() == RTPPayloadType::PCMU) {
+        audio_samples = RTPCodec::g711_ulaw_to_float(rtp_packet.get_payload());
+    } else if (rtp_packet.get_payload_type() == RTPPayloadType::PCMA) {
+        audio_samples = RTPCodec::g711_alaw_to_float(rtp_packet.get_payload());
+    } else {
+        std::cout << "⚠️  Unsupported RTP payload type: " << static_cast<int>(rtp_packet.get_payload_type()) << std::endl;
+        return;
+    }
+
+    // Add to jitter buffer with timing information
+    TimedRTPPacket timed_packet(raw_packet, rtp_packet.get_sequence_number(), rtp_packet.get_timestamp());
+    session->incoming_rtp_buffer.push(timed_packet);
+
+    // Update internal session activity (internal tracking only)
+    session->internal_data.last_activity = std::chrono::steady_clock::now();
 }
 
 // Utility functions

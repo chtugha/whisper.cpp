@@ -9,6 +9,8 @@ find_package(OpenSSL REQUIRED)
 add_executable(whisper-http-server
     http-server.cpp
     simple-http-api.cpp
+    whisper-service.cpp
+    audio-stream-processor.cpp
     database.cpp
 )
 
@@ -71,6 +73,7 @@ target_include_directories(${TARGET} PRIVATE ${OPENSSL_INCLUDE_DIR})
 # Link HTTP server module
 target_link_libraries(whisper-http-server PRIVATE
     common
+    whisper
     ${OPENSSL_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
     sqlite3)

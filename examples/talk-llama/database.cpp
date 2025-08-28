@@ -272,17 +272,35 @@ bool Database::update_session_whisper(const std::string& session_id, const std::
 bool Database::update_session_llama(const std::string& session_id, const std::string& llama_response) {
     const char* sql = "UPDATE call_sessions SET llama_response = ? WHERE session_id = ?";
     sqlite3_stmt* stmt;
-    
+
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, llama_response.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, session_id.c_str(), -1, SQLITE_STATIC);
-        
+
         bool success = sqlite3_step(stmt) == SQLITE_DONE;
         sqlite3_finalize(stmt);
         return success;
     }
     sqlite3_finalize(stmt);
     return false;
+}
+
+bool Database::append_session_llama(const std::string& session_id, const std::string& llama_text) {
+    // Get current llama_response
+    CallSession session = get_session(session_id);
+    if (session.session_id.empty()) {
+        return false;
+    }
+
+    // Append new text
+    std::string accumulated_response = session.llama_response;
+    if (!accumulated_response.empty()) {
+        accumulated_response += " ";
+    }
+    accumulated_response += llama_text;
+
+    // Update with accumulated text
+    return update_session_llama(session_id, accumulated_response);
 }
 
 bool Database::update_session_piper(const std::string& session_id, const std::string& piper_audio_path) {

@@ -53,6 +53,7 @@ public:
     std::string create_session(int caller_id, const std::string& phone_number, int line_id, const std::string& user_id = "");
     bool update_session_whisper(const std::string& session_id, const std::string& whisper_data);
     bool update_session_llama(const std::string& session_id, const std::string& llama_response);
+    bool append_session_llama(const std::string& session_id, const std::string& llama_text);
     bool update_session_piper(const std::string& session_id, const std::string& piper_audio_path);
     CallSession get_session(const std::string& session_id);
 

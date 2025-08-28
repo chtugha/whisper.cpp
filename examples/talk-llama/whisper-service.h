@@ -3,6 +3,7 @@
 #include "whisper.h"
 #include "database.h"
 #include "audio-stream-processor.h"
+#include "jitter-buffer.h"
 #include <string>
 #include <memory>
 #include <unordered_map>
@@ -32,12 +33,21 @@ struct WhisperSession {
     std::string conversation_context;
     std::chrono::steady_clock::time_point last_activity;
     bool is_active;
-    
-    WhisperSession(const std::string& id) 
+    std::mutex session_mutex;  // Per-session mutex for thread safety
+
+    // Jitter buffer for incoming audio chunks
+    std::unique_ptr<AudioSampleBuffer> audio_jitter_buffer;
+
+    WhisperSession(const std::string& id)
         : session_id(id), state(nullptr), is_active(true),
-          last_activity(std::chrono::steady_clock::now()) {}
-    
+          last_activity(std::chrono::steady_clock::now()),
+          audio_jitter_buffer(std::make_unique<AudioSampleBuffer>(5, 1)) {} // 5 max, 1 min
+
     ~WhisperSession() {
+        std::lock_guard<std::mutex> lock(session_mutex);
+        if (audio_jitter_buffer) {
+            audio_jitter_buffer->stop();
+        }
         if (state) {
             whisper_free_state(state);
         }
@@ -57,9 +67,17 @@ public:
     
     // Model management
     bool load_model(const std::string& model_path, const std::string& model_name = "");
+    bool load_model_with_memory_check(const std::string& model_path, const std::string& model_name = "");
     void unload_model();
     bool is_model_loaded() const { return whisper_ctx_ != nullptr; }
+    bool is_loading() const { return loading_.load(); }
     std::string get_loaded_model_name() const { return current_model_name_; }
+
+    // Memory management
+    size_t get_available_memory_mb() const;
+    size_t estimate_model_memory_mb(const std::string& model_path) const;
+    bool check_memory_sufficient(const std::string& model_path) const;
+    std::string find_best_model_for_memory() const;
     
     // Model discovery and management
     std::vector<WhisperModel> get_available_models();
@@ -71,8 +89,8 @@ public:
     void end_session(const std::string& session_id);
     bool has_session(const std::string& session_id);
     
-    // Audio processing
-    void add_audio(const std::string& session_id, const std::vector<float>& audio_samples);
+    // Direct transcription API (expects properly formatted 16kHz mono chunks)
+    std::string transcribe_chunk(const std::string& session_id, const std::vector<float>& audio_chunk);
     std::string transcribe_session_audio(const std::string& session_id);
     
     // Configuration
@@ -83,10 +101,15 @@ public:
     struct ServiceStatus {
         bool is_running;
         bool model_loaded;
+        bool is_loading;
         std::string model_name;
         int active_sessions;
         std::string model_language;
         size_t total_processed_audio;
+        size_t available_memory_mb;
+        size_t required_memory_mb;
+        bool memory_sufficient;
+        std::string memory_status;
     };
     ServiceStatus get_status();
     
@@ -101,16 +124,17 @@ private:
     std::unordered_map<std::string, std::unique_ptr<WhisperSession>> sessions_;
     std::mutex sessions_mutex_;
     
-    // Audio processing
-    std::unique_ptr<AudioStreamProcessor> audio_processor_;
+    // Audio processing removed - handled by external AudioProcessorService
     
     // Service state
     std::atomic<bool> running_;
+    std::atomic<bool> loading_;
     std::thread cleanup_thread_;
     
     // Configuration
     std::string default_language_;
     std::string models_directory_;
+    std::string last_chosen_model_;
     Database* database_;
     
     // Statistics

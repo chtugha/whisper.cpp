@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sstream>
@@ -1315,19 +1316,39 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
     std::cout << "   Family: AF_INET" << std::endl;
     std::cout << "   Port: " << line.server_port << " (network order: " << ntohs(server_addr.sin_port) << ")" << std::endl;
 
-    // Convert IP address
-    std::cout << "🔍 Converting IP address: " << line.server_ip << std::endl;
+    // Convert IP address or resolve hostname
+    std::cout << "🔍 Resolving address: " << line.server_ip << std::endl;
+
+    // First try direct IP address conversion
     int inet_result = inet_pton(AF_INET, line.server_ip.c_str(), &server_addr.sin_addr);
-    if (inet_result <= 0) {
-        if (inet_result == 0) {
-            std::cout << "❌ Invalid IP address format: " << line.server_ip << std::endl;
-        } else {
-            std::cout << "❌ inet_pton failed: " << strerror(errno) << std::endl;
+    if (inet_result == 1) {
+        std::cout << "✅ Direct IP address conversion successful" << std::endl;
+    } else {
+        // Try hostname resolution
+        std::cout << "🔍 Attempting hostname resolution for: " << line.server_ip << std::endl;
+
+        struct addrinfo hints, *result;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;  // IPv4
+        hints.ai_socktype = SOCK_DGRAM;
+
+        int getaddr_result = getaddrinfo(line.server_ip.c_str(), nullptr, &hints, &result);
+        if (getaddr_result != 0) {
+            std::cout << "❌ Hostname resolution failed: " << gai_strerror(getaddr_result) << std::endl;
+            close(sock);
+            return false;
         }
-        close(sock);
-        return false;
+
+        // Use the first result
+        struct sockaddr_in* addr_in = (struct sockaddr_in*)result->ai_addr;
+        server_addr.sin_addr = addr_in->sin_addr;
+
+        char ip_str[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &server_addr.sin_addr, ip_str, INET_ADDRSTRLEN);
+        std::cout << "✅ Hostname resolved to: " << ip_str << std::endl;
+
+        freeaddrinfo(result);
     }
-    std::cout << "✅ IP address converted successfully" << std::endl;
 
     // Set socket timeout
     std::cout << "⏱️  Setting socket timeouts (3 seconds)..." << std::endl;
@@ -1690,7 +1711,26 @@ bool SimpleSipClient::send_authenticated_register(const SipLineConfig& line, con
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(line.server_port);
-    inet_pton(AF_INET, line.server_ip.c_str(), &server_addr.sin_addr);
+
+    // Resolve IP address or hostname
+    int inet_result = inet_pton(AF_INET, line.server_ip.c_str(), &server_addr.sin_addr);
+    if (inet_result != 1) {
+        // Try hostname resolution
+        struct addrinfo hints, *result;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+
+        int getaddr_result = getaddrinfo(line.server_ip.c_str(), nullptr, &hints, &result);
+        if (getaddr_result != 0) {
+            std::cout << "❌ Failed to resolve address: " << line.server_ip << std::endl;
+            return false;
+        }
+
+        struct sockaddr_in* addr_in = (struct sockaddr_in*)result->ai_addr;
+        server_addr.sin_addr = addr_in->sin_addr;
+        freeaddrinfo(result);
+    }
 
     // Calculate digest response (with or without qop based on PBX support)
     std::string uri = "sip:" + line.server_ip;

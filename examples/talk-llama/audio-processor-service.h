@@ -4,11 +4,13 @@
 #include "simple-audio-processor.h"
 #include "whisper-connector.h"
 #include "database.h"
+#include "jitter-buffer.h"
 #include <memory>
 #include <string>
 #include <atomic>
 #include <thread>
 #include <functional>
+#include <unordered_map>
 
 // Standalone Audio Processor Service
 // Runs independently, SIP client connects to it via interface
@@ -86,12 +88,25 @@ private:
 
     // Connection to SIP client
     std::function<void(const std::string&, const std::vector<uint8_t>&)> sip_client_callback_;
+
+    // Jitter buffers for stable audio processing
+    std::unordered_map<std::string, std::unique_ptr<AudioChunkBuffer>> incoming_audio_buffers_;
+    std::unordered_map<std::string, std::unique_ptr<RTPPacketBuffer>> outgoing_audio_buffers_;
+    std::mutex buffers_mutex_;
     
     // Internal methods
     void handle_whisper_transcription(const std::string& session_id, const std::vector<float>& audio_samples);
     bool check_sip_client_connection();
     void update_database_transcription(const std::string& session_id, const std::string& text);
     std::string simulate_whisper_transcription(const std::vector<float>& audio_samples);
+
+    // Jitter buffer processing
+    void process_buffered_audio(const std::string& session_id);
+    void process_outgoing_buffer(const std::string& session_id);
+    void cleanup_session_buffers(const std::string& session_id);
+    std::vector<float> convert_g711_ulaw_to_float(const std::vector<uint8_t>& data);
+    std::vector<float> convert_g711_alaw_to_float(const std::vector<uint8_t>& data);
+    std::vector<uint8_t> convert_float_to_g711_ulaw(const std::vector<float>& samples);
 };
 
 // Audio Processor Service Factory
