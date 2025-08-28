@@ -1,9 +1,13 @@
-// Standalone SIP Client Module
+// Standalone SIP Client Module - Optimized for Fast Audio Processing
 // Handles incoming calls, creates database sessions, manages audio streams
 // Manages SIP line connections and status updates
 
 #include "database.h"
+#include "audio-processor-interface.h"
+#include "audio-processor-service.h"
 #include <iostream>
+#include <unordered_map>
+#include <chrono>
 #include <signal.h>
 #include <thread>
 #include <chrono>
@@ -74,12 +78,24 @@ std::string calculate_md5(const std::string& input) {
     return ss.str();
 }
 
+// Forward declaration
+class AudioProcessorService;
+
 class SimpleSipClient {
 public:
     SimpleSipClient();
     ~SimpleSipClient();
 
     bool init(Database* database, int specific_line_id = -1);
+    bool init_audio_processors();
+    bool has_audio_processor(int line_id);
+    void check_and_reconnect_processors();
+    bool is_processor_alive(int line_id);
+
+    // SIP networking
+    bool setup_sip_listener();
+    void sip_listener_loop();
+    int allocate_dynamic_port();
     bool start();
     void stop();
 
@@ -87,8 +103,8 @@ public:
     void handle_incoming_call(const std::string& caller_number);
     void end_call(const std::string& session_id);
 
-    // Audio streaming (placeholder for now)
-    void stream_audio_to_whisper(const std::string& session_id, const std::vector<uint8_t>& audio_data);
+    // Audio streaming
+    void process_rtp_audio(const std::string& session_id, const RTPAudioPacket& packet);
     void stream_audio_from_piper(const std::string& session_id, const std::vector<uint8_t>& audio_data);
 
 private:
@@ -97,6 +113,21 @@ private:
     int specific_line_id_; // -1 means process all enabled lines
     std::thread sip_thread_;
     std::thread connection_monitor_thread_;
+
+    // Per-line audio processors (simple)
+    std::unordered_map<int, std::unique_ptr<AudioProcessorService>> line_audio_processors_;
+    std::mutex processors_mutex_;
+
+    // SIP networking
+    int sip_listen_socket_;
+    int sip_listen_port_;
+    std::string local_ip_;
+    std::thread sip_listener_thread_;
+
+    // Registration state tracking
+    std::map<int, bool> line_registered_; // line_id -> is_registered
+    std::map<int, std::chrono::steady_clock::time_point> last_registration_; // line_id -> last_reg_time
+    std::mutex registration_mutex_;
 
     // Active calls
     std::map<std::string, SipCallSession> active_calls_;
@@ -108,6 +139,7 @@ private:
 
     // Main loops
     void sip_management_loop();
+    void sip_message_listener();
     void connection_monitor_loop();
 
     // SIP line connection management
@@ -126,9 +158,11 @@ private:
     bool parse_www_authenticate(const std::string& auth_header, std::string& realm, std::string& nonce);
     bool send_authenticated_register(const SipLineConfig& line, const std::string& realm, const std::string& nonce, bool supports_qop = false, const std::string& call_id = "");
 
+    // Incoming call handling
+    void handle_sip_message(const std::string& message, const struct sockaddr_in& sender_addr);
+    void handle_invite(const std::string& message, const struct sockaddr_in& sender_addr);
+    void send_sip_response(int code, const std::string& reason, const std::string& call_id, const std::string& from, const std::string& to, const std::string& via, int cseq, const struct sockaddr_in& dest_addr);
 
-    // Call simulation (for testing)
-    void simulate_incoming_call();
 
     // Port management - use caller database ID directly
     int get_caller_port(int caller_id) const {
@@ -140,13 +174,23 @@ private:
 
 // Global variables for signal handling
 static bool g_running = true;
+static bool g_shutdown_in_progress = false;
 static std::unique_ptr<SimpleSipClient> g_sip_client;
 
 void signal_handler(int signal) {
+    // Prevent double shutdown
+    if (g_shutdown_in_progress) {
+        std::cout << "\nShutdown already in progress, ignoring signal " << signal << std::endl;
+        return;
+    }
+
+    g_shutdown_in_progress = true;
     std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
     g_running = false;
+
     if (g_sip_client) {
         g_sip_client->stop();
+        g_sip_client.reset(); // Clear the pointer to prevent double-stop
     }
 }
 
@@ -154,7 +198,6 @@ void print_usage() {
     std::cout << "Usage: whisper-sip-client [options]\n"
               << "Options:\n"
               << "  --db PATH          Database file path (default: whisper_talk.db)\n"
-              << "  --simulate         Run in simulation mode (no real SIP)\n"
               << "  --help             Show this help message\n"
               << "\nNote: SIP line configurations are read from the database.\n"
               << "      Use the web interface to configure SIP lines.\n"
@@ -163,7 +206,6 @@ void print_usage() {
 
 int main(int argc, char** argv) {
     std::string db_path = "whisper_talk.db";
-    bool simulate = false;
     int specific_line_id = -1; // -1 means process all enabled lines
 
     // Parse command line arguments
@@ -171,8 +213,7 @@ int main(int argc, char** argv) {
         std::string arg = argv[i];
         if (arg == "--db" && i + 1 < argc) {
             db_path = argv[++i];
-        } else if (arg == "--simulate") {
-            simulate = true;
+
         } else if (arg == "--line-id" && i + 1 < argc) {
             specific_line_id = std::atoi(argv[++i]);
         } else if (arg == "--help") {
@@ -186,7 +227,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "📞 Starting Whisper Talk LLaMA SIP Client..." << std::endl;
-    std::cout << "   Mode: " << (simulate ? "Simulation" : "Database-driven SIP") << std::endl;
     std::cout << "   Database: " << db_path << std::endl;
     if (specific_line_id != -1) {
         std::cout << "   Target Line ID: " << specific_line_id << " (single line mode)" << std::endl;
@@ -224,7 +264,7 @@ int main(int argc, char** argv) {
     
     // Main loop
     while (g_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10)); // Fast response
     }
     
     std::cout << "🛑 Shutting down SIP client..." << std::endl;
@@ -236,7 +276,9 @@ int main(int argc, char** argv) {
 }
 
 // SimpleSipClient implementation
-SimpleSipClient::SimpleSipClient() : database_(nullptr), running_(false) {}
+SimpleSipClient::SimpleSipClient() : database_(nullptr), running_(false),
+                                   sip_listen_socket_(-1), sip_listen_port_(0), local_ip_("192.168.10.150") {
+}
 
 SimpleSipClient::~SimpleSipClient() {
     stop();
@@ -253,26 +295,431 @@ bool SimpleSipClient::init(Database* database, int specific_line_id) {
 
     // Load SIP lines from database
     load_sip_lines_from_database();
+
+    // Try to initialize audio processors (optional - SIP client works without them)
+    init_audio_processors();
+
     return true;
 }
 
+bool SimpleSipClient::init_audio_processors() {
+    // Optional: Try to create audio processors for enabled lines
+    // If this fails, SIP client will still work but drop audio
+
+    if (!database_) {
+        std::cout << "⚠️ No database available, audio processors disabled" << std::endl;
+        return true; // Still allow SIP client to run
+    }
+
+    auto sip_lines = database_->get_all_sip_lines();
+
+    for (const auto& line : sip_lines) {
+        if (line.enabled) {
+            try {
+                // Create audio processor for this line
+                auto audio_processor = AudioProcessorServiceFactory::create();
+                audio_processor->set_database(database_);
+
+                // Start the audio processor (but it will sleep until activated)
+                if (audio_processor->start(8083 + line.line_id)) {
+                    line_audio_processors_[line.line_id] = std::move(audio_processor);
+                    std::cout << "✅ Audio processor created for SIP line " << line.line_id << std::endl;
+                } else {
+                    std::cout << "⚠️ Failed to start audio processor for SIP line " << line.line_id
+                              << " (audio will be dropped)" << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cout << "⚠️ Exception creating audio processor for line " << line.line_id
+                          << ": " << e.what() << " (audio will be dropped)" << std::endl;
+            }
+        }
+    }
+
+    if (line_audio_processors_.empty()) {
+        std::cout << "⚠️ No audio processors available - SIP client will run but drop all audio" << std::endl;
+    } else {
+        std::cout << "✅ Initialized " << line_audio_processors_.size() << " audio processors" << std::endl;
+    }
+
+    return true; // Always return true - SIP client can run without audio processors
+}
+
+int SimpleSipClient::allocate_dynamic_port() {
+    // Try to find an available port starting from 5061 (5060 is typically reserved for PBX)
+    for (int port = 5061; port <= 5100; port++) {
+        int test_socket = socket(AF_INET, SOCK_DGRAM, 0);
+        if (test_socket < 0) continue;
+
+        struct sockaddr_in addr;
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(port);
+
+        if (bind(test_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            close(test_socket);
+            std::cout << "🔌 Allocated dynamic SIP port: " << port << std::endl;
+            return port;
+        }
+        close(test_socket);
+    }
+
+    std::cout << "❌ Failed to allocate dynamic SIP port" << std::endl;
+    return -1;
+}
+
+bool SimpleSipClient::setup_sip_listener() {
+    std::cout << "🔧 Setting up SIP listener..." << std::endl;
+
+    // Allocate dynamic port
+    sip_listen_port_ = allocate_dynamic_port();
+    if (sip_listen_port_ < 0) {
+        std::cout << "❌ Failed to allocate dynamic port" << std::endl;
+        return false;
+    }
+    std::cout << "✅ Allocated port: " << sip_listen_port_ << std::endl;
+
+    // Create listening socket
+    sip_listen_socket_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sip_listen_socket_ < 0) {
+        std::cout << "❌ Failed to create SIP listening socket: " << strerror(errno) << std::endl;
+        return false;
+    }
+
+    // Bind to allocated port
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(sip_listen_port_);
+
+    if (bind(sip_listen_socket_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cout << "❌ Failed to bind SIP socket to port " << sip_listen_port_ << ": " << strerror(errno) << std::endl;
+        close(sip_listen_socket_);
+        sip_listen_socket_ = -1;
+        return false;
+    }
+
+    std::cout << "✅ SIP listener bound to port " << sip_listen_port_ << std::endl;
+    return true;
+}
+
+void SimpleSipClient::sip_listener_loop() {
+    std::cout << "👂 SIP LISTENER THREAD STARTED!" << std::endl;
+    std::cout << "👂 Starting SIP listener on port " << sip_listen_port_ << std::endl;
+    std::cout << "🔍 SIP listener socket fd: " << sip_listen_socket_ << std::endl;
+
+    // Basic socket validation
+    if (sip_listen_socket_ < 0) {
+        std::cout << "❌ INVALID SOCKET FD: " << sip_listen_socket_ << std::endl;
+        return;
+    }
+
+    if (sip_listen_port_ <= 0) {
+        std::cout << "❌ INVALID PORT: " << sip_listen_port_ << std::endl;
+        return;
+    }
+
+    char buffer[4096];
+    struct sockaddr_in sender_addr;
+    socklen_t addr_len = sizeof(sender_addr);
+
+    int loop_count = 0;
+    while (running_) {
+        loop_count++;
+
+        // Debug: Show listener is active every 30 seconds
+        if (loop_count % 30 == 0) {
+            std::cout << "👂 SIP listener active (waiting for packets on port " << sip_listen_port_ << ")..." << std::endl;
+        }
+
+        // Set a timeout so we can check running_ periodically
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        setsockopt(sip_listen_socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+        ssize_t received = recvfrom(sip_listen_socket_, buffer, sizeof(buffer) - 1, 0,
+                                   (struct sockaddr*)&sender_addr, &addr_len);
+
+        if (received > 0) {
+            buffer[received] = '\0';
+            std::string message(buffer);
+
+            std::cout << "📨 Received SIP message (" << received << " bytes)" << std::endl;
+            std::cout << "📋 From: " << inet_ntoa(sender_addr.sin_addr) << ":" << ntohs(sender_addr.sin_port) << std::endl;
+            std::cout << "📄 Message preview: " << message.substr(0, std::min(100, (int)message.length())) << "..." << std::endl;
+
+            // Handle the SIP message
+            handle_sip_message(message, sender_addr);
+        } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            if (running_) {
+                std::cout << "❌ SIP listener error: " << strerror(errno) << " (errno: " << errno << ")" << std::endl;
+            }
+            break;
+        }
+        // received == 0 or timeout - continue loop
+    }
+
+    std::cout << "👂 SIP listener stopped" << std::endl;
+}
+
+void SimpleSipClient::handle_sip_message(const std::string& message, const struct sockaddr_in& sender_addr) {
+    std::cout << "🔍 Parsing SIP message..." << std::endl;
+
+    // Check if it's an INVITE (incoming call)
+    if (message.find("INVITE ") == 0) {
+        std::cout << "📞 Incoming INVITE detected!" << std::endl;
+        handle_invite(message, sender_addr);
+    }
+    // Check if it's a BYE (call termination)
+    else if (message.find("BYE ") == 0) {
+        std::cout << "📞 Call termination (BYE) received" << std::endl;
+        // TODO: Handle BYE message
+    }
+    // Check if it's an ACK
+    else if (message.find("ACK ") == 0) {
+        std::cout << "✅ ACK received - call established" << std::endl;
+        // TODO: Handle ACK message
+    }
+    // Other SIP messages
+    else {
+        std::cout << "📋 Other SIP message: " << message.substr(0, message.find('\r')) << std::endl;
+    }
+}
+
+void SimpleSipClient::handle_invite(const std::string& message, const struct sockaddr_in& sender_addr) {
+    std::cout << "📞 Processing INVITE message..." << std::endl;
+
+    // Parse key SIP headers
+    std::string call_id, from, to, via, contact;
+    int cseq = 0;
+
+    std::istringstream iss(message);
+    std::string line;
+
+    while (std::getline(iss, line)) {
+        if (line.find("Call-ID:") == 0) {
+            call_id = line.substr(9);
+            // Remove \r if present
+            if (!call_id.empty() && call_id.back() == '\r') {
+                call_id.pop_back();
+            }
+        } else if (line.find("From:") == 0) {
+            from = line.substr(6);
+            if (!from.empty() && from.back() == '\r') {
+                from.pop_back();
+            }
+        } else if (line.find("To:") == 0) {
+            to = line.substr(4);
+            if (!to.empty() && to.back() == '\r') {
+                to.pop_back();
+            }
+        } else if (line.find("Via:") == 0) {
+            via = line.substr(5);
+            if (!via.empty() && via.back() == '\r') {
+                via.pop_back();
+            }
+        } else if (line.find("CSeq:") == 0) {
+            std::string cseq_line = line.substr(6);
+            if (!cseq_line.empty() && cseq_line.back() == '\r') {
+                cseq_line.pop_back();
+            }
+            cseq = std::stoi(cseq_line.substr(0, cseq_line.find(' ')));
+        }
+    }
+
+    std::cout << "📋 INVITE Details:" << std::endl;
+    std::cout << "   Call-ID: " << call_id << std::endl;
+    std::cout << "   From: " << from << std::endl;
+    std::cout << "   To: " << to << std::endl;
+    std::cout << "   CSeq: " << cseq << std::endl;
+
+    // Send 200 OK response to accept the call
+    send_sip_response(200, "OK", call_id, from, to, via, cseq, sender_addr);
+
+    // Extract caller number from From header for database
+    std::string caller_number = "unknown";
+    size_t sip_pos = from.find("sip:");
+    if (sip_pos != std::string::npos) {
+        size_t start = sip_pos + 4;
+        size_t end = from.find("@", start);
+        if (end != std::string::npos) {
+            caller_number = from.substr(start, end - start);
+        }
+    }
+
+    std::cout << "📞 Extracted caller number: " << caller_number << std::endl;
+
+    // Create database session for this call
+    handle_incoming_call(caller_number);
+}
+
+void SimpleSipClient::send_sip_response(int code, const std::string& reason, const std::string& call_id,
+                                       const std::string& from, const std::string& to, const std::string& via,
+                                       int cseq, const struct sockaddr_in& dest_addr) {
+    std::cout << "📤 Sending SIP " << code << " " << reason << " response..." << std::endl;
+
+    // Create SIP response
+    std::ostringstream response;
+    response << "SIP/2.0 " << code << " " << reason << "\r\n";
+    response << "Via: " << via << "\r\n";
+    response << "From: " << from << "\r\n";
+    response << "To: " << to << ";tag=tag-" << rand() % 10000 << "\r\n";
+    response << "Call-ID: " << call_id << "\r\n";
+    response << "CSeq: " << cseq << " INVITE\r\n";
+    response << "Contact: <sip:whisper@" << local_ip_ << ":" << sip_listen_port_ << ">\r\n";
+    response << "Content-Type: application/sdp\r\n";
+
+    // Add SDP for audio (basic G.711 μ-law)
+    std::string sdp =
+        "v=0\r\n"
+        "o=whisper 123456 654321 IN IP4 " + local_ip_ + "\r\n"
+        "s=Whisper Talk Session\r\n"
+        "c=IN IP4 " + local_ip_ + "\r\n"
+        "t=0 0\r\n"
+        "m=audio 8000 RTP/AVP 0\r\n"
+        "a=rtpmap:0 PCMU/8000\r\n";
+
+    response << "Content-Length: " << sdp.length() << "\r\n";
+    response << "\r\n";
+    response << sdp;
+
+    std::string response_str = response.str();
+
+    // Send response
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock >= 0) {
+        ssize_t sent = sendto(sock, response_str.c_str(), response_str.length(), 0,
+                             (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+
+        if (sent > 0) {
+            std::cout << "✅ SIP response sent (" << sent << " bytes)" << std::endl;
+        } else {
+            std::cout << "❌ Failed to send SIP response: " << strerror(errno) << std::endl;
+        }
+
+        close(sock);
+    } else {
+        std::cout << "❌ Failed to create socket for SIP response" << std::endl;
+    }
+}
+
+bool SimpleSipClient::has_audio_processor(int line_id) {
+    std::lock_guard<std::mutex> lock(processors_mutex_);
+    return line_audio_processors_.find(line_id) != line_audio_processors_.end();
+}
+
+bool SimpleSipClient::is_processor_alive(int line_id) {
+    std::lock_guard<std::mutex> lock(processors_mutex_);
+    auto it = line_audio_processors_.find(line_id);
+    if (it == line_audio_processors_.end()) {
+        return false;
+    }
+
+    try {
+        // Quick health check - if this throws, processor is dead
+        auto status = it->second->get_status();
+        return status.is_running;
+    } catch (...) {
+        // Processor crashed or disconnected
+        std::cout << "💀 Audio processor for line " << line_id << " appears to be dead" << std::endl;
+        return false;
+    }
+}
+
+void SimpleSipClient::check_and_reconnect_processors() {
+    if (!database_) return;
+
+    auto sip_lines = database_->get_all_sip_lines();
+
+    for (const auto& line : sip_lines) {
+        if (!line.enabled) continue;
+
+        std::lock_guard<std::mutex> lock(processors_mutex_);
+        auto it = line_audio_processors_.find(line.line_id);
+
+        if (it == line_audio_processors_.end()) {
+            // No processor for this line - try to create one
+            try {
+                auto audio_processor = AudioProcessorServiceFactory::create();
+                audio_processor->set_database(database_);
+
+                if (audio_processor->start(8083 + line.line_id)) {
+                    line_audio_processors_[line.line_id] = std::move(audio_processor);
+                    std::cout << "🔄 Reconnected audio processor for SIP line " << line.line_id << std::endl;
+                }
+            } catch (...) {
+                // Failed to reconnect - will try again later
+            }
+        } else {
+            // Check if existing processor is still alive
+            if (!is_processor_alive(line.line_id)) {
+                // Remove dead processor
+                line_audio_processors_.erase(it);
+                std::cout << "🗑️ Removed dead audio processor for line " << line.line_id << std::endl;
+            }
+        }
+    }
+}
+
 bool SimpleSipClient::start() {
-    if (running_) return false;
+    std::cout << "🚀 SimpleSipClient::start() called" << std::endl;
+
+    if (running_) {
+        std::cout << "⚠️ SIP client already running" << std::endl;
+        return false;
+    }
+
+    std::cout << "🔧 Setting up SIP listener..." << std::endl;
+    // Setup SIP listener first
+    if (!setup_sip_listener()) {
+        std::cout << "❌ Failed to setup SIP listener" << std::endl;
+        return false;
+    }
+    std::cout << "✅ SIP listener setup complete" << std::endl;
 
     running_ = true;
+
+    std::cout << "🚀 Starting SIP threads..." << std::endl;
     sip_thread_ = std::thread(&SimpleSipClient::sip_management_loop, this);
+    std::cout << "✅ SIP management thread started" << std::endl;
+
+    sip_listener_thread_ = std::thread(&SimpleSipClient::sip_listener_loop, this);
+    std::cout << "✅ SIP listener thread started" << std::endl;
+
     connection_monitor_thread_ = std::thread(&SimpleSipClient::connection_monitor_loop, this);
+    std::cout << "✅ Connection monitor thread started" << std::endl;
+
     return true;
 }
 
 void SimpleSipClient::stop() {
+    if (!running_) return; // Already stopped
+
+    std::cout << "🛑 Stopping SIP client..." << std::endl;
     running_ = false;
-    if (sip_thread_.joinable()) {
-        sip_thread_.join();
+
+    // Close SIP listener socket to unblock listener thread
+    if (sip_listen_socket_ >= 0) {
+        close(sip_listen_socket_);
+        sip_listen_socket_ = -1;
     }
-    if (connection_monitor_thread_.joinable()) {
-        connection_monitor_thread_.join();
+
+    // Join threads safely
+    try {
+        if (sip_thread_.joinable()) {
+            sip_thread_.join();
+        }
+        if (sip_listener_thread_.joinable()) {
+            sip_listener_thread_.join();
+        }
+        if (connection_monitor_thread_.joinable()) {
+            connection_monitor_thread_.join();
+        }
+    } catch (const std::exception& e) {
+        std::cout << "⚠️ Thread join error: " << e.what() << std::endl;
     }
+
+    std::cout << "✅ SIP client stopped" << std::endl;
 }
 
 void SimpleSipClient::handle_incoming_call(const std::string& caller_number) {
@@ -291,6 +738,24 @@ void SimpleSipClient::handle_incoming_call(const std::string& caller_number) {
         std::cerr << "❌ Failed to create session" << std::endl;
         return;
     }
+
+    // Step 2.5: Activate audio processor for this line (if available)
+    int line_id = (specific_line_id_ != -1) ? specific_line_id_ : 1; // Default to line 1
+    {
+        std::lock_guard<std::mutex> lock(processors_mutex_);
+        auto it = line_audio_processors_.find(line_id);
+        if (it != line_audio_processors_.end()) {
+            try {
+                AudioSessionParams params(session_id, caller_number, line_id);
+                it->second->create_session(params);
+                std::cout << "🎵 Activated audio processor for line " << line_id << ", session " << session_id << std::endl;
+            } catch (...) {
+                std::cout << "💥 Failed to activate audio processor for line " << line_id << " - removing" << std::endl;
+                line_audio_processors_.erase(it);
+            }
+        }
+    }
+    // If no processor, audio will be silently dropped
 
     // Step 3: Assign unique port for this caller
     int caller_port = get_caller_port(caller_id);
@@ -313,22 +778,35 @@ void SimpleSipClient::handle_incoming_call(const std::string& caller_number) {
     std::cout << "📱 Call answered automatically. Session active on port " << caller_port << std::endl;
     std::cout << "🎤 Ready to receive audio for session: " << session_id << " (port: " << caller_port << ")" << std::endl;
 
-    // Simulate some audio processing
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    // Simulate audio data to Whisper
-    std::vector<uint8_t> dummy_audio = {0x01, 0x02, 0x03, 0x04}; // Placeholder
-    stream_audio_to_whisper(session_id, dummy_audio);
-
-    // Simulate call duration
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-
-    // End call
-    end_call(session_id);
+    // Real call is now active - audio will be processed when RTP packets arrive
+    // Call will be ended when SIP BYE is received
 }
 
 void SimpleSipClient::end_call(const std::string& session_id) {
     std::cout << "📞 Ending call for session: " << session_id << std::endl;
+
+    // Deactivate audio processor (if available)
+    {
+        std::lock_guard<std::mutex> calls_lock(calls_mutex_);
+        auto call_it = active_calls_.find(session_id);
+        if (call_it != active_calls_.end()) {
+            int line_id = call_it->second.internal_port; // Using internal_port as line_id
+
+            {
+                std::lock_guard<std::mutex> proc_lock(processors_mutex_);
+                auto proc_it = line_audio_processors_.find(line_id);
+                if (proc_it != line_audio_processors_.end()) {
+                    try {
+                        proc_it->second->end_session(session_id);
+                        std::cout << "😴 Audio processor for line " << line_id << " put to sleep" << std::endl;
+                    } catch (...) {
+                        std::cout << "💥 Audio processor crashed during deactivation for line " << line_id << " - removing" << std::endl;
+                        line_audio_processors_.erase(proc_it);
+                    }
+                }
+            }
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lock(calls_mutex_);
@@ -342,18 +820,34 @@ void SimpleSipClient::end_call(const std::string& session_id) {
     std::cout << "✅ Call ended successfully" << std::endl;
 }
 
-void SimpleSipClient::stream_audio_to_whisper(const std::string& session_id, const std::vector<uint8_t>& audio_data) {
-    std::cout << "🎤 Streaming " << audio_data.size() << " bytes of audio to Whisper for session: " << session_id << std::endl;
+void SimpleSipClient::process_rtp_audio(const std::string& session_id, const RTPAudioPacket& packet) {
+    // Fast path: get line_id with minimal locking
+    int line_id = -1;
+    {
+        std::lock_guard<std::mutex> calls_lock(calls_mutex_);
+        auto call_it = active_calls_.find(session_id);
+        if (call_it == active_calls_.end()) {
+            return; // Silently drop audio for unknown sessions
+        }
+        line_id = call_it->second.internal_port; // Using internal_port as line_id
+    }
 
-    // TODO: In real implementation, this would:
-    // 1. Write audio data to a queue/file for Whisper module
-    // 2. Signal Whisper module to process this session_id
-    // 3. Whisper module would update database with transcribed text
-
-    // For now, simulate by updating database directly
-    std::string dummy_text = "Hello, this is a test transcription from caller.";
-    database_->update_session_whisper(session_id, dummy_text);
-    std::cout << "✅ Simulated Whisper transcription: \"" << dummy_text << "\"" << std::endl;
+    // Fast path: process audio with crash protection
+    {
+        std::lock_guard<std::mutex> proc_lock(processors_mutex_);
+        auto proc_it = line_audio_processors_.find(line_id);
+        if (proc_it != line_audio_processors_.end()) {
+            try {
+                // Send RTP packet directly to processor (fastest path)
+                proc_it->second->process_audio(session_id, packet);
+            } catch (...) {
+                // Processor crashed - remove it and drop audio
+                std::cout << "💥 Audio processor crashed for line " << line_id << " - removing" << std::endl;
+                line_audio_processors_.erase(proc_it);
+            }
+        }
+    }
+    // If no processor, silently drop audio
 }
 
 void SimpleSipClient::stream_audio_from_piper(const std::string& session_id, const std::vector<uint8_t>& audio_data) {
@@ -379,7 +873,14 @@ void SimpleSipClient::load_sip_lines_from_database() {
 }
 
 bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
+    // Ensure SIP listener is ready before attempting registration
+    if (sip_listen_port_ <= 0) {
+        std::cout << "⚠️ SIP listener not ready yet, skipping registration for line " << line.line_id << std::endl;
+        return false;
+    }
+
     std::cout << "\n🔍 ===== TESTING SIP REGISTRATION =====" << std::endl;
+    std::cout << "🔌 Using dynamic SIP port: " << sip_listen_port_ << std::endl;
     std::cout << "📋 Line Details:" << std::endl;
     std::cout << "   Line ID: " << line.line_id << std::endl;
     std::cout << "   Extension: " << line.extension << std::endl;
@@ -443,12 +944,12 @@ bool SimpleSipClient::test_sip_connection(const SipLineConfig& line) {
 
     std::ostringstream sip_register;
     sip_register << "REGISTER sip:" << line.server_ip << " SIP/2.0\r\n";
-    sip_register << "Via: SIP/2.0/UDP 192.168.10.150:5060;branch=z9hG4bK-" << rand() % 10000 << "\r\n";
+    sip_register << "Via: SIP/2.0/UDP " << local_ip_ << ":" << sip_listen_port_ << ";branch=z9hG4bK-" << rand() % 10000 << "\r\n";
     sip_register << "From: <sip:" << line.username << "@" << line.server_ip << ">;tag=" << from_tag << "\r\n";
     sip_register << "To: <sip:" << line.username << "@" << line.server_ip << ">\r\n";
     sip_register << "Call-ID: " << call_id << "\r\n";
     sip_register << "CSeq: 1 REGISTER\r\n";
-    sip_register << "Contact: <sip:" << line.username << "@192.168.10.150:5060>\r\n";
+    sip_register << "Contact: <sip:" << line.username << "@" << local_ip_ << ":" << sip_listen_port_ << ">\r\n";
     sip_register << "Max-Forwards: 70\r\n";
     sip_register << "User-Agent: Generic SIP Client/1.0\r\n";
     sip_register << "Expires: 3600\r\n";
@@ -585,10 +1086,16 @@ void SimpleSipClient::update_line_status(int line_id, const std::string& status)
 void SimpleSipClient::sip_management_loop() {
     std::cout << "📞 Starting SIP management loop (ready for real calls)..." << std::endl;
 
+    int reconnect_counter = 0;
     while (running_) {
-        // Just wait - no simulation
-        // Real SIP calls will be handled when they come in
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        // Fast loop for real-time SIP processing
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        // Check for processor reconnections every 5 seconds (100 * 50ms)
+        if (++reconnect_counter >= 100) {
+            check_and_reconnect_processors();
+            reconnect_counter = 0;
+        }
 
         if (!running_) break;
     }
@@ -598,6 +1105,9 @@ void SimpleSipClient::sip_management_loop() {
 
 void SimpleSipClient::connection_monitor_loop() {
     std::cout << "🔍 Starting SIP connection monitor..." << std::endl;
+
+    // Wait a moment for SIP listener to be ready
+    std::this_thread::sleep_for(std::chrono::seconds(2));
 
     while (running_) {
         // Reload SIP lines from database (in case they were updated via web interface)
@@ -616,21 +1126,58 @@ void SimpleSipClient::connection_monitor_loop() {
                     // Update disabled lines to disconnected status
                     if (line.status != "disabled") {
                         update_line_status(line.line_id, "disabled");
+                        // Mark as not registered
+                        std::lock_guard<std::mutex> reg_lock(registration_mutex_);
+                        line_registered_[line.line_id] = false;
                     }
                     continue;
                 }
 
-                // Test connection for enabled lines
-                update_line_status(line.line_id, "connecting");
+                // Check if line is already registered
+                bool is_registered = false;
+                bool needs_refresh = false;
+                {
+                    std::lock_guard<std::mutex> reg_lock(registration_mutex_);
+                    is_registered = line_registered_[line.line_id];
 
-                bool connected = test_sip_connection(line);
-                std::string new_status = connected ? "connected" : "error";
-                update_line_status(line.line_id, new_status);
+                    // Check if registration needs refresh (every 30 minutes)
+                    auto now = std::chrono::steady_clock::now();
+                    if (is_registered && last_registration_.count(line.line_id)) {
+                        auto time_since_reg = std::chrono::duration_cast<std::chrono::minutes>(
+                            now - last_registration_[line.line_id]);
+                        needs_refresh = (time_since_reg.count() >= 30);
+                    }
+                }
+
+                if (!is_registered || needs_refresh) {
+                    // Only register if not registered or needs refresh
+                    std::cout << "📞 " << (is_registered ? "Refreshing" : "Registering")
+                              << " SIP line " << line.line_id << std::endl;
+
+                    update_line_status(line.line_id, "connecting");
+                    bool connected = test_sip_connection(line);
+
+                    if (connected) {
+                        std::lock_guard<std::mutex> reg_lock(registration_mutex_);
+                        line_registered_[line.line_id] = true;
+                        last_registration_[line.line_id] = std::chrono::steady_clock::now();
+                        update_line_status(line.line_id, "connected");
+                        std::cout << "✅ SIP line " << line.line_id << " registered successfully" << std::endl;
+                    } else {
+                        std::lock_guard<std::mutex> reg_lock(registration_mutex_);
+                        line_registered_[line.line_id] = false;
+                        update_line_status(line.line_id, "error");
+                        std::cout << "❌ SIP line " << line.line_id << " registration failed" << std::endl;
+                    }
+                } else {
+                    // Already registered and doesn't need refresh
+                    std::cout << "✅ SIP line " << line.line_id << " already registered (keeping alive)" << std::endl;
+                }
             }
         }
 
-        // Wait 30 seconds before next connection test cycle
-        for (int i = 0; i < 30 && running_; ++i) {
+        // Wait 5 minutes before next connection check cycle (since we maintain registration)
+        for (int i = 0; i < 300 && running_; ++i) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }
@@ -728,12 +1275,12 @@ bool SimpleSipClient::send_authenticated_register(const SipLineConfig& line, con
 
     std::ostringstream sip_register;
     sip_register << "REGISTER sip:" << line.server_ip << " SIP/2.0\r\n";
-    sip_register << "Via: SIP/2.0/UDP 192.168.10.150:5060;branch=z9hG4bK-auth-" << rand() % 10000 << "\r\n";
+    sip_register << "Via: SIP/2.0/UDP " << local_ip_ << ":" << sip_listen_port_ << ";branch=z9hG4bK-auth-" << rand() % 10000 << "\r\n";
     sip_register << "From: <sip:" << line.username << "@" << line.server_ip << ">;tag=" << from_tag << "\r\n";
     sip_register << "To: <sip:" << line.username << "@" << line.server_ip << ">\r\n";
     sip_register << "Call-ID: " << actual_call_id << "\r\n";
     sip_register << "CSeq: 2 REGISTER\r\n";
-    sip_register << "Contact: <sip:" << line.username << "@192.168.10.150:5060>\r\n";
+    sip_register << "Contact: <sip:" << line.username << "@" << local_ip_ << ":" << sip_listen_port_ << ">\r\n";
     sip_register << "Authorization: Digest username=\"" << line.username << "\", realm=\"" << realm
                  << "\", nonce=\"" << nonce << "\", uri=\"" << uri << "\", response=\"" << digest_response
                  << "\", algorithm=MD5";

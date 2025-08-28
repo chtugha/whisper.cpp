@@ -10,6 +10,7 @@
 
 // Forward declarations
 class Database;
+class WhisperService;
 struct SipLineConfig;
 
 // Simple HTTP server for web interface only
@@ -36,7 +37,7 @@ struct SipLineConfig;
 
 class SimpleHttpServer {
 public:
-    SimpleHttpServer(int port, Database* database = nullptr);
+    SimpleHttpServer(int port, Database* database = nullptr, WhisperService* whisper_service = nullptr);
     ~SimpleHttpServer();
 
     bool start();
@@ -67,9 +68,18 @@ private:
     HttpResponse api_sip_lines_post(const HttpRequest& request);
     HttpResponse api_sip_lines_delete(const HttpRequest& request, int line_id);
     HttpResponse api_sip_lines_toggle(const HttpRequest& request, int line_id);
+
+    // Whisper model management API
+    HttpResponse api_whisper_status(const HttpRequest& request);
+    HttpResponse api_whisper_models(const HttpRequest& request);
+    HttpResponse api_whisper_load_model(const HttpRequest& request);
+    HttpResponse api_whisper_upload_model(const HttpRequest& request);
     
     std::string get_mime_type(const std::string& extension);
 
     // Database connection
     Database* database_;
+
+    // Whisper service connection
+    WhisperService* whisper_service_;
 };

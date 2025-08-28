@@ -16,6 +16,16 @@ add_executable(whisper-http-server
 add_executable(whisper-sip-client
     sip-client-main.cpp
     database.cpp
+    audio-processor-service.cpp
+    simple-audio-processor.cpp
+)
+
+# Audio Processor Service Module
+add_executable(whisper-audio-processor
+    audio-processor-main.cpp
+    audio-processor-service.cpp
+    simple-audio-processor.cpp
+    database.cpp
 )
 
 target_include_directories(whisper-sip-client PRIVATE ${OPENSSL_INCLUDE_DIR})
@@ -66,7 +76,15 @@ target_link_libraries(whisper-http-server PRIVATE
 # Link SIP client module
 target_link_libraries(whisper-sip-client PRIVATE
     common
+    whisper
     ${OPENSSL_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+    sqlite3)
+
+# Link Audio Processor module
+target_link_libraries(whisper-audio-processor PRIVATE
+    common
+    whisper
     ${CMAKE_THREAD_LIBS_INIT}
     sqlite3)
 

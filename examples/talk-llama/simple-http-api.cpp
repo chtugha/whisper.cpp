@@ -8,8 +8,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 
-SimpleHttpServer::SimpleHttpServer(int port, Database* database)
-    : port_(port), server_socket_(-1), running_(false), database_(database) {}
+SimpleHttpServer::SimpleHttpServer(int port, Database* database, WhisperService* whisper_service)
+    : port_(port), server_socket_(-1), running_(false), database_(database), whisper_service_(whisper_service) {}
 
 SimpleHttpServer::~SimpleHttpServer() {
     stop();
@@ -170,8 +170,11 @@ std::string SimpleHttpServer::create_response(const HttpResponse& response) {
 }
 
 HttpResponse SimpleHttpServer::handle_request(const HttpRequest& request) {
-    std::cout << request.method << " " << request.path << std::endl;
-    
+    // Only log non-status API requests to reduce spam
+    if (request.path != "/api/status") {
+        std::cout << request.method << " " << request.path << std::endl;
+    }
+
     // API routes
     if (request.path.substr(0, 5) == "/api/") {
         return handle_api_request(request);
@@ -528,7 +531,10 @@ HttpResponse SimpleHttpServer::serve_static_file(const std::string& path) {
 }
 
 HttpResponse SimpleHttpServer::handle_api_request(const HttpRequest& request) {
-    std::cout << "API Request: " << request.method << " " << request.path << std::endl;
+    // Only log non-status API requests to reduce spam
+    if (request.path != "/api/status") {
+        std::cout << "API Request: " << request.method << " " << request.path << std::endl;
+    }
 
     if (request.path == "/api/status") {
         return api_status(request);
