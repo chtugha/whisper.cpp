@@ -72,7 +72,7 @@ const std::vector<float>& G711Tables::get_alaw_table() {
 // SimpleAudioProcessor Implementation
 SimpleAudioProcessor::SimpleAudioProcessor(SipAudioInterface* sip_interface)
     : sip_interface_(sip_interface), running_(false),
-      chunk_duration_ms_(3000), vad_threshold_(0.01f), silence_timeout_ms_(500) {
+      chunk_duration_ms_(3000), vad_threshold_(0.01f), silence_timeout_ms_(500), database_(nullptr) {
     
     G711Tables::initialize_tables(); // Initialize lookup tables
 }
@@ -138,16 +138,33 @@ void SimpleAudioProcessor::process_audio(const std::string& session_id, const RT
     
     // Append audio to buffer
     session.audio_buffer.insert(session.audio_buffer.end(), audio_samples.begin(), audio_samples.end());
-    
+
     // Fast VAD check
     if (has_speech(audio_samples)) {
         session.has_speech = true;
         session.last_speech_time = std::chrono::steady_clock::now();
     }
-    
-    // Check if we should send chunk
-    if (should_send_chunk(session)) {
-        send_audio_chunk(session_id, session);
+
+    // Use dynamic chunking based on system speed
+    int system_speed = get_system_speed_from_database();
+
+    // Create chunks using system speed
+    auto chunks = create_chunks_from_pcm(session.audio_buffer, system_speed);
+
+    // Send each chunk
+    for (const auto& chunk : chunks) {
+        if (sip_interface_) {
+            sip_interface_->send_to_whisper(session_id, chunk);
+            sip_interface_->on_audio_chunk_ready(session_id, chunk.size());
+        }
+        std::cout << "📤 Sent dynamic chunk: " << chunk.size() << " samples (speed=" << system_speed << ") for session " << session_id << std::endl;
+    }
+
+    // Clear processed audio from buffer
+    if (!chunks.empty()) {
+        session.audio_buffer.clear();
+        session.has_speech = false;
+        session.chunk_start_time = std::chrono::steady_clock::now();
     }
 }
 
@@ -259,6 +276,97 @@ void SimpleAudioProcessor::send_audio_chunk(const std::string& session_id, Sessi
     session.chunk_start_time = std::chrono::steady_clock::now();
     
     std::cout << "📤 Sent audio chunk: " << whisper_chunk.size() << " samples for session " << session_id << std::endl;
+}
+
+std::vector<std::vector<float>> SimpleAudioProcessor::create_chunks_from_pcm(const std::vector<float>& pcm_data, int system_speed) {
+    std::vector<std::vector<float>> chunks;
+
+    if (pcm_data.empty()) return chunks;
+
+    // System speed determines chunking strategy:
+    // 1 = slow (max audio per chunk)
+    // 5 = fast (word-level chunks)
+
+    size_t window_size = 160; // 20ms at 8kHz (typical word boundary)
+    size_t min_chunk_size = window_size * (6 - system_speed); // Inverse relationship
+
+    std::vector<float> current_chunk;
+    bool in_speech = false;
+
+    for (size_t i = 0; i < pcm_data.size(); i += window_size) {
+        size_t end = std::min(i + window_size, pcm_data.size());
+        std::vector<float> window(pcm_data.begin() + i, pcm_data.begin() + end);
+
+        bool has_speech = !detect_silence_gap(window, SILENCE_THRESHOLD);
+
+        if (has_speech) {
+            // Add speech to current chunk
+            current_chunk.insert(current_chunk.end(), window.begin(), window.end());
+            in_speech = true;
+        } else if (in_speech) {
+            // End of speech - create chunk if minimum size reached
+            if (current_chunk.size() >= min_chunk_size) {
+                // Pad to target size
+                std::vector<float> padded_chunk = pad_chunk_to_target_size(current_chunk, TARGET_CHUNK_SIZE);
+                chunks.push_back(padded_chunk);
+                current_chunk.clear();
+                in_speech = false;
+            } else {
+                // Add silence to continue building chunk
+                current_chunk.insert(current_chunk.end(), window.begin(), window.end());
+            }
+        }
+
+        // Force chunk creation if too large
+        if (current_chunk.size() >= TARGET_CHUNK_SIZE) {
+            chunks.push_back(pad_chunk_to_target_size(current_chunk, TARGET_CHUNK_SIZE));
+            current_chunk.clear();
+            in_speech = false;
+        }
+    }
+
+    // Handle remaining audio
+    if (!current_chunk.empty()) {
+        chunks.push_back(pad_chunk_to_target_size(current_chunk, TARGET_CHUNK_SIZE));
+    }
+
+    return chunks;
+}
+
+bool SimpleAudioProcessor::detect_silence_gap(const std::vector<float>& audio_segment, float threshold) {
+    if (audio_segment.empty()) return true;
+
+    float energy = 0.0f;
+    for (float sample : audio_segment) {
+        energy += sample * sample;
+    }
+    energy /= audio_segment.size();
+
+    return energy < threshold;
+}
+
+std::vector<float> SimpleAudioProcessor::pad_chunk_to_target_size(const std::vector<float>& chunk, size_t target_size) {
+    std::vector<float> padded_chunk = chunk;
+
+    if (padded_chunk.size() < target_size) {
+        // Pad with silence
+        padded_chunk.resize(target_size, 0.0f);
+    } else if (padded_chunk.size() > target_size) {
+        // Truncate to target size
+        padded_chunk.resize(target_size);
+    }
+
+    return padded_chunk;
+}
+
+int SimpleAudioProcessor::get_system_speed_from_database() {
+    // Get system speed from database
+    if (database_) {
+        return database_->get_system_speed();
+    }
+
+    // Fallback to default if no database connection
+    return DEFAULT_SYSTEM_SPEED;
 }
 
 std::vector<float> SimpleAudioProcessor::prepare_whisper_chunk(const std::vector<float>& audio) {

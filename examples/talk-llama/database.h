@@ -16,6 +16,8 @@ struct CallSession {
     std::string session_id;
     int caller_id;
     std::string phone_number;
+    int line_id;                    // Which SIP line handled this call
+    std::string user_id;            // Optional unique user identifier
     std::string start_time;
     std::string whisper_data;
     std::string llama_response;
@@ -48,7 +50,7 @@ public:
     std::vector<Caller> get_all_callers();
     
     // Session management
-    std::string create_session(int caller_id, const std::string& phone_number);
+    std::string create_session(int caller_id, const std::string& phone_number, int line_id, const std::string& user_id = "");
     bool update_session_whisper(const std::string& session_id, const std::string& whisper_data);
     bool update_session_llama(const std::string& session_id, const std::string& llama_response);
     bool update_session_piper(const std::string& session_id, const std::string& piper_audio_path);
@@ -64,7 +66,11 @@ public:
     bool delete_sip_line(int line_id);
     SipLineConfig get_sip_line(int line_id);
     std::vector<CallSession> get_caller_sessions(int caller_id, int limit = 10);
-    
+
+    // System configuration
+    int get_system_speed(); // 1-5 scale (1=slow, 5=fast)
+    bool set_system_speed(int speed);
+
 private:
     sqlite3* db_;
     bool create_tables();

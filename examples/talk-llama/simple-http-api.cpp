@@ -543,7 +543,7 @@ HttpResponse SimpleHttpServer::handle_api_request(const HttpRequest& request) {
     } else if (request.path == "/api/callers") {
         return api_callers(request);
     } else if (request.path == "/api/sessions") {
-        return api_sessions(request);
+        return api_sessions_get(request);
     } else if (request.path.length() > 15 && request.path.substr(0, 15) == "/api/sip-lines/" && request.method == "DELETE") {
         // Extract line_id from path like /api/sip-lines/1
         std::cout << "Matched DELETE sip-lines endpoint: " << request.path << std::endl;
@@ -568,6 +568,18 @@ HttpResponse SimpleHttpServer::handle_api_request(const HttpRequest& request) {
             return api_sip_lines(request);
         } else if (request.method == "POST") {
             return api_sip_lines_post(request);
+        }
+    } else if (request.path == "/api/system/speed") {
+        std::cout << "Matched system speed endpoint" << std::endl;
+        if (request.method == "GET") {
+            return api_system_speed_get(request);
+        } else if (request.method == "POST") {
+            return api_system_speed_post(request);
+        }
+    } else if (request.path == "/api/sessions") {
+        std::cout << "Matched sessions endpoint" << std::endl;
+        if (request.method == "GET") {
+            return api_sessions_get(request);
         }
     }
 
@@ -614,14 +626,7 @@ HttpResponse SimpleHttpServer::api_callers(const HttpRequest& request) {
     return response;
 }
 
-HttpResponse SimpleHttpServer::api_sessions(const HttpRequest& request) {
-    HttpResponse response;
-    response.status_code = 200;
-    response.status_text = "OK";
-    response.body = R"({"sessions": []})";
-    response.headers["Content-Type"] = "application/json";
-    return response;
-}
+
 
 std::string SimpleHttpServer::get_mime_type(const std::string& extension) {
     if (extension == ".html") return "text/html";
@@ -876,6 +881,127 @@ HttpResponse SimpleHttpServer::api_sip_lines_toggle(const HttpRequest& request, 
         response.status_text = "Not Found";
         response.body = R"({"error": "SIP line not found"})";
     }
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_system_speed_get(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!database_) {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = R"({"error": "Database not available"})";
+        return response;
+    }
+
+    int speed = database_->get_system_speed();
+
+    response.status_code = 200;
+    response.status_text = "OK";
+    response.body = "{\"system_speed\": " + std::to_string(speed) + "}";
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_system_speed_post(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!database_) {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = R"({"error": "Database not available"})";
+        return response;
+    }
+
+    // Parse speed from request body (JSON: {"system_speed": 3})
+    int speed = 3; // Default
+
+    // Simple JSON parsing for speed value
+    size_t speed_pos = request.body.find("\"system_speed\"");
+    if (speed_pos != std::string::npos) {
+        size_t colon_pos = request.body.find(":", speed_pos);
+        if (colon_pos != std::string::npos) {
+            size_t start = colon_pos + 1;
+            while (start < request.body.length() && (request.body[start] == ' ' || request.body[start] == '\t')) start++;
+            size_t end = start;
+            while (end < request.body.length() && std::isdigit(request.body[end])) end++;
+            if (end > start) {
+                speed = std::stoi(request.body.substr(start, end - start));
+            }
+        }
+    }
+
+    // Validate speed range (1-5)
+    if (speed < 1 || speed > 5) {
+        response.status_code = 400;
+        response.status_text = "Bad Request";
+        response.body = R"({"error": "System speed must be between 1 and 5"})";
+        return response;
+    }
+
+    bool success = database_->set_system_speed(speed);
+
+    if (success) {
+        response.status_code = 200;
+        response.status_text = "OK";
+        response.body = "{\"success\": true, \"system_speed\": " + std::to_string(speed) + "}";
+        std::cout << "🎛️ System speed updated to: " << speed << std::endl;
+    } else {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = R"({"error": "Failed to update system speed"})";
+    }
+
+    return response;
+}
+
+HttpResponse SimpleHttpServer::api_sessions_get(const HttpRequest& request) {
+    HttpResponse response;
+    response.headers["Content-Type"] = "application/json";
+
+    if (!database_) {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = R"({"error": "Database not available"})";
+        return response;
+    }
+
+    // Get all callers and their sessions
+    auto callers = database_->get_all_callers();
+
+    std::ostringstream json;
+    json << "{\"sessions\":[";
+
+    bool first_session = true;
+    for (const auto& caller : callers) {
+        auto sessions = database_->get_caller_sessions(caller.id, 50); // Get up to 50 sessions per caller
+
+        for (const auto& session : sessions) {
+            if (!first_session) json << ",";
+            first_session = false;
+
+            json << "{"
+                 << "\"session_id\":\"" << session.session_id << "\","
+                 << "\"caller_id\":" << session.caller_id << ","
+                 << "\"phone_number\":\"" << session.phone_number << "\","
+                 << "\"line_id\":" << session.line_id << ","
+                 << "\"user_id\":\"" << session.user_id << "\","
+                 << "\"start_time\":\"" << session.start_time << "\","
+                 << "\"whisper_data\":\"" << session.whisper_data << "\","
+                 << "\"llama_response\":\"" << session.llama_response << "\","
+                 << "\"piper_audio_path\":\"" << session.piper_audio_path << "\""
+                 << "}";
+        }
+    }
+
+    json << "]}";
+
+    response.status_code = 200;
+    response.status_text = "OK";
+    response.body = json.str();
 
     return response;
 }

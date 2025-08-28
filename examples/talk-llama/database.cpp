@@ -48,6 +48,8 @@ bool Database::create_tables() {
             session_id TEXT PRIMARY KEY,
             caller_id INTEGER NOT NULL,
             phone_number TEXT,
+            line_id INTEGER NOT NULL,
+            user_id TEXT,
             start_time TEXT NOT NULL,
             whisper_data TEXT,
             llama_response TEXT,
@@ -55,6 +57,7 @@ bool Database::create_tables() {
             FOREIGN KEY(caller_id) REFERENCES callers(id)
         );
         CREATE INDEX IF NOT EXISTS idx_caller_id ON call_sessions(caller_id);
+        CREATE INDEX IF NOT EXISTS idx_line_id ON call_sessions(line_id);
         CREATE INDEX IF NOT EXISTS idx_start_time ON call_sessions(start_time);
     )";
     
@@ -90,7 +93,24 @@ bool Database::create_tables() {
         CREATE INDEX IF NOT EXISTS idx_extension ON sip_lines(extension);
     )";
 
+    // Create system configuration table
+    const char* system_config_sql = R"(
+        CREATE TABLE IF NOT EXISTS system_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT OR IGNORE INTO system_config (key, value) VALUES ('system_speed', '3');
+    )";
+
     rc = sqlite3_exec(db_, sip_lines_sql, nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        std::cerr << "SQL error: " << err_msg << std::endl;
+        sqlite3_free(err_msg);
+        return false;
+    }
+
+    rc = sqlite3_exec(db_, system_config_sql, nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         std::cerr << "SQL error: " << err_msg << std::endl;
         sqlite3_free(err_msg);
@@ -172,19 +192,21 @@ bool Database::update_caller_last_call(int caller_id) {
     return false;
 }
 
-std::string Database::create_session(int caller_id, const std::string& phone_number) {
+std::string Database::create_session(int caller_id, const std::string& phone_number, int line_id, const std::string& user_id) {
     std::string session_id = generate_uuid();
     std::string timestamp = get_current_timestamp();
-    
-    const char* sql = "INSERT INTO call_sessions (session_id, caller_id, phone_number, start_time) VALUES (?, ?, ?, ?)";
+
+    const char* sql = "INSERT INTO call_sessions (session_id, caller_id, phone_number, line_id, user_id, start_time) VALUES (?, ?, ?, ?, ?, ?)";
     sqlite3_stmt* stmt;
-    
+
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, session_id.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_int(stmt, 2, caller_id);
         sqlite3_bind_text(stmt, 3, phone_number.empty() ? nullptr : phone_number.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 4, timestamp.c_str(), -1, SQLITE_STATIC);
-        
+        sqlite3_bind_int(stmt, 4, line_id);
+        sqlite3_bind_text(stmt, 5, user_id.empty() ? nullptr : user_id.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 6, timestamp.c_str(), -1, SQLITE_STATIC);
+
         if (sqlite3_step(stmt) == SQLITE_DONE) {
             sqlite3_finalize(stmt);
             return session_id;
@@ -192,6 +214,43 @@ std::string Database::create_session(int caller_id, const std::string& phone_num
     }
     sqlite3_finalize(stmt);
     return "";
+}
+
+CallSession Database::get_session(const std::string& session_id) {
+    CallSession session;
+    const char* sql = "SELECT session_id, caller_id, phone_number, line_id, user_id, start_time, whisper_data, llama_response, piper_audio_path FROM call_sessions WHERE session_id = ?";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, session_id.c_str(), -1, SQLITE_STATIC);
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            session.session_id = (char*)sqlite3_column_text(stmt, 0);
+            session.caller_id = sqlite3_column_int(stmt, 1);
+
+            const char* phone = (char*)sqlite3_column_text(stmt, 2);
+            session.phone_number = phone ? phone : "";
+
+            session.line_id = sqlite3_column_int(stmt, 3);
+
+            const char* user_id = (char*)sqlite3_column_text(stmt, 4);
+            session.user_id = user_id ? user_id : "";
+
+            const char* start_time = (char*)sqlite3_column_text(stmt, 5);
+            session.start_time = start_time ? start_time : "";
+
+            const char* whisper = (char*)sqlite3_column_text(stmt, 6);
+            session.whisper_data = whisper ? whisper : "";
+
+            const char* llama = (char*)sqlite3_column_text(stmt, 7);
+            session.llama_response = llama ? llama : "";
+
+            const char* piper = (char*)sqlite3_column_text(stmt, 8);
+            session.piper_audio_path = piper ? piper : "";
+        }
+    }
+    sqlite3_finalize(stmt);
+    return session;
 }
 
 bool Database::update_session_whisper(const std::string& session_id, const std::string& whisper_data) {
@@ -408,4 +467,104 @@ bool Database::delete_sip_line(int line_id) {
 
     sqlite3_finalize(stmt);
     return success;
+}
+
+int Database::get_system_speed() {
+    const char* sql = "SELECT value FROM system_config WHERE key = 'system_speed'";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char* value = (char*)sqlite3_column_text(stmt, 0);
+            int speed = value ? std::stoi(value) : 3;
+            sqlite3_finalize(stmt);
+            return speed;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return 3; // Default speed
+}
+
+bool Database::set_system_speed(int speed) {
+    const char* sql = "UPDATE system_config SET value = ?, updated_at = ? WHERE key = 'system_speed'";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        std::string timestamp = get_current_timestamp();
+        sqlite3_bind_text(stmt, 1, std::to_string(speed).c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, timestamp.c_str(), -1, SQLITE_STATIC);
+
+        bool success = sqlite3_step(stmt) == SQLITE_DONE;
+        sqlite3_finalize(stmt);
+        return success;
+    }
+    sqlite3_finalize(stmt);
+    return false;
+}
+
+std::vector<Caller> Database::get_all_callers() {
+    std::vector<Caller> callers;
+    const char* sql = "SELECT id, phone_number, created_at, last_call FROM callers ORDER BY last_call DESC";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            Caller caller;
+            caller.id = sqlite3_column_int(stmt, 0);
+
+            const char* phone = (char*)sqlite3_column_text(stmt, 1);
+            caller.phone_number = phone ? phone : "";
+
+            const char* created = (char*)sqlite3_column_text(stmt, 2);
+            caller.created_at = created ? created : "";
+
+            const char* last_call = (char*)sqlite3_column_text(stmt, 3);
+            caller.last_call = last_call ? last_call : "";
+
+            callers.push_back(caller);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return callers;
+}
+
+std::vector<CallSession> Database::get_caller_sessions(int caller_id, int limit) {
+    std::vector<CallSession> sessions;
+    const char* sql = "SELECT session_id, caller_id, phone_number, line_id, user_id, start_time, whisper_data, llama_response, piper_audio_path FROM call_sessions WHERE caller_id = ? ORDER BY start_time DESC LIMIT ?";
+    sqlite3_stmt* stmt;
+
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) == SQLITE_OK) {
+        sqlite3_bind_int(stmt, 1, caller_id);
+        sqlite3_bind_int(stmt, 2, limit);
+
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            CallSession session;
+            session.session_id = (char*)sqlite3_column_text(stmt, 0);
+            session.caller_id = sqlite3_column_int(stmt, 1);
+
+            const char* phone = (char*)sqlite3_column_text(stmt, 2);
+            session.phone_number = phone ? phone : "";
+
+            session.line_id = sqlite3_column_int(stmt, 3);
+
+            const char* user_id = (char*)sqlite3_column_text(stmt, 4);
+            session.user_id = user_id ? user_id : "";
+
+            const char* start_time = (char*)sqlite3_column_text(stmt, 5);
+            session.start_time = start_time ? start_time : "";
+
+            const char* whisper = (char*)sqlite3_column_text(stmt, 6);
+            session.whisper_data = whisper ? whisper : "";
+
+            const char* llama = (char*)sqlite3_column_text(stmt, 7);
+            session.llama_response = llama ? llama : "";
+
+            const char* piper = (char*)sqlite3_column_text(stmt, 8);
+            session.piper_audio_path = piper ? piper : "";
+
+            sessions.push_back(session);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return sessions;
 }

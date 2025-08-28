@@ -1,6 +1,7 @@
 #pragma once
 
 #include "audio-processor-interface.h"
+#include "database.h"
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
@@ -28,6 +29,7 @@ public:
     void set_chunk_duration_ms(int ms) { chunk_duration_ms_ = ms; }
     void set_vad_threshold(float threshold) { vad_threshold_ = threshold; }
     void set_silence_timeout_ms(int ms) { silence_timeout_ms_ = ms; }
+    void set_database(Database* database) { database_ = database; }
     
 private:
     // Session state - minimal data
@@ -57,6 +59,12 @@ private:
     int chunk_duration_ms_;
     float vad_threshold_;
     int silence_timeout_ms_;
+    Database* database_;
+
+    // Chunking configuration
+    static constexpr size_t TARGET_CHUNK_SIZE = 16000 * 2; // 2 seconds at 16kHz
+    static constexpr float SILENCE_THRESHOLD = 0.01f;
+    static constexpr int DEFAULT_SYSTEM_SPEED = 3; // Medium speed
     
     // Fast audio processing methods
     std::vector<float> decode_rtp_audio(const RTPAudioPacket& packet);
@@ -75,6 +83,12 @@ private:
     bool should_send_chunk(const SessionState& session);
     void send_audio_chunk(const std::string& session_id, SessionState& session);
     std::vector<float> prepare_whisper_chunk(const std::vector<float>& audio);
+
+    // Advanced chunking with system speed
+    std::vector<std::vector<float>> create_chunks_from_pcm(const std::vector<float>& pcm_data, int system_speed);
+    bool detect_silence_gap(const std::vector<float>& audio_segment, float threshold = 0.01f);
+    std::vector<float> pad_chunk_to_target_size(const std::vector<float>& chunk, size_t target_size);
+    int get_system_speed_from_database();
     
     // Utility
     std::vector<float> resample_8k_to_16k(const std::vector<float>& input);

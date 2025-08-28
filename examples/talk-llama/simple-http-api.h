@@ -63,11 +63,15 @@ private:
     // API endpoints
     HttpResponse api_status(const HttpRequest& request);
     HttpResponse api_callers(const HttpRequest& request);
-    HttpResponse api_sessions(const HttpRequest& request);
+    HttpResponse api_sessions_get(const HttpRequest& request);
     HttpResponse api_sip_lines(const HttpRequest& request);
     HttpResponse api_sip_lines_post(const HttpRequest& request);
     HttpResponse api_sip_lines_delete(const HttpRequest& request, int line_id);
     HttpResponse api_sip_lines_toggle(const HttpRequest& request, int line_id);
+
+    // System configuration endpoints
+    HttpResponse api_system_speed_get(const HttpRequest& request);
+    HttpResponse api_system_speed_post(const HttpRequest& request);
 
     // Whisper model management API
     HttpResponse api_whisper_status(const HttpRequest& request);

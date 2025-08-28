@@ -18,6 +18,7 @@ add_executable(whisper-sip-client
     database.cpp
     audio-processor-service.cpp
     simple-audio-processor.cpp
+    whisper-connector.cpp
 )
 
 # Audio Processor Service Module
@@ -25,6 +26,7 @@ add_executable(whisper-audio-processor
     audio-processor-main.cpp
     audio-processor-service.cpp
     simple-audio-processor.cpp
+    whisper-connector.cpp
     database.cpp
 )
 
@@ -79,14 +81,16 @@ target_link_libraries(whisper-sip-client PRIVATE
     whisper
     ${OPENSSL_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
-    sqlite3)
+    sqlite3
+    curl)
 
 # Link Audio Processor module
 target_link_libraries(whisper-audio-processor PRIVATE
     common
     whisper
     ${CMAKE_THREAD_LIBS_INIT}
-    sqlite3)
+    sqlite3
+    curl)
 
 # Link main target
 target_link_libraries(${TARGET} PRIVATE
