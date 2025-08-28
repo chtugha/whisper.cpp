@@ -3,6 +3,8 @@
 #include "whisper.h"
 #include "llama.h"
 #include "tts-engine.h"
+#include "common-whisper.h"
+#include "database.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -11,9 +13,54 @@
 #include <thread>
 #include <queue>
 #include <chrono>
+#include <condition_variable>
+#include <unordered_map>
 
-// Forward declarations
-struct whisper_params;
+// command-line parameters
+struct whisper_params {
+    int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
+    int32_t voice_ms   = 10000;
+    int32_t capture_id = -1;
+    int32_t max_tokens = 32;
+    int32_t audio_ctx  = 0;
+    int32_t n_gpu_layers = 999;
+    int32_t seed = 0;
+    int32_t top_k = 5;
+    int32_t min_keep = 1;
+    float top_p = 0.80f;
+    float min_p = 0.01f;
+    float temp  = 0.30f;
+
+    float vad_thold  = 0.6f;
+    float freq_thold = 100.0f;
+
+    bool translate      = false;
+    bool print_special  = false;
+    bool print_energy   = false;
+    bool no_timestamps  = true;
+    bool verbose_prompt = false;
+    bool use_gpu        = true;
+    bool flash_attn     = false;
+
+    int32_t http_port = 8081;            // HTTP API server port
+
+    std::string person      = "Georgi";
+    std::string bot_name    = "LLaMA";
+    std::string wake_cmd    = "";
+    std::string heard_ok    = "";
+    std::string language    = "en";
+    std::string model_wsp   = "models/ggml-base.en.bin";
+    std::string model_llama = "models/ggml-llama-7B.bin";
+    std::string speak       = "./examples/talk-llama/speak";
+    std::string speak_file  = "./examples/talk-llama/to_speak.txt";
+    std::string prompt      = "";
+    std::string fname_out;
+    std::string path_session = "";       // path to file for saving/loading model eval state
+};
+
+// Helper functions for LLaMA tokenization (defined in talk-llama.cpp)
+std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos);
+std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token);
 
 // SIP client configuration
 struct SipClientConfig {
@@ -73,8 +120,8 @@ struct SipCallSession {
     std::chrono::steady_clock::time_point call_start_time;
     std::chrono::steady_clock::time_point last_activity;
     
-    SipCallSession(const std::string& id, const std::string& caller, 
-                   struct whisper_state* w_state, llama_seq_id seq_id)
+    SipCallSession(const std::string& id, const std::string& caller,
+                   struct whisper_state* w_state, ::llama_seq_id seq_id)
         : call_id(id), caller_number(caller), whisper_state(w_state), 
           llama_seq_id(seq_id), n_past(0), need_to_save_session(false),
           call_start_time(std::chrono::steady_clock::now()),
@@ -126,7 +173,7 @@ private:
     
     // Call management
     std::unordered_map<std::string, std::shared_ptr<SipCallSession>> active_calls_;
-    std::mutex calls_mutex_;
+    mutable std::mutex calls_mutex_;
     
     // Sequence ID management for LLaMA sessions
     std::atomic<llama_seq_id> next_seq_id_{1};
@@ -199,6 +246,9 @@ private:
     // Shared TTS engine
     std::unique_ptr<TtsManager> tts_manager_;
     std::mutex tts_mutex_;
+
+    // Database for session management
+    Database database_;
     
     // Client management
     std::unordered_map<std::string, std::unique_ptr<SipClient>> clients_;

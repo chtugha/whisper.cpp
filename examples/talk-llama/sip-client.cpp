@@ -374,21 +374,28 @@ bool SipClientManager::init(struct whisper_context* whisper_ctx,
     llama_ctx_ = llama_ctx;
     params_ = params;
 
-    // Initialize shared LLaMA resources
-    shared_batch_ = llama_batch_init(llama_n_ctx(llama_ctx_), 0, 1);
+    // Initialize shared LLaMA resources only if LLaMA context is available
+    if (llama_ctx_) {
+        shared_batch_ = llama_batch_init(llama_n_ctx(llama_ctx_), 0, 1);
 
-    // Initialize shared sampler
-    auto sparams = llama_sampler_chain_default_params();
-    shared_sampler_ = llama_sampler_chain_init(sparams);
+        // Initialize shared sampler
+        auto sparams = llama_sampler_chain_default_params();
+        shared_sampler_ = llama_sampler_chain_init(sparams);
 
-    if (params_.temp > 0.0f) {
-        llama_sampler_chain_add(shared_sampler_, llama_sampler_init_top_k(params_.top_k));
-        llama_sampler_chain_add(shared_sampler_, llama_sampler_init_top_p(params_.top_p, params_.min_keep));
-        llama_sampler_chain_add(shared_sampler_, llama_sampler_init_temp(params_.temp));
-        llama_sampler_chain_add(shared_sampler_, llama_sampler_init_dist(params_.seed));
-        llama_sampler_chain_add(shared_sampler_, llama_sampler_init_min_p(params_.min_p, params_.min_keep));
+        if (params_.temp > 0.0f) {
+            llama_sampler_chain_add(shared_sampler_, llama_sampler_init_top_k(params_.top_k));
+            llama_sampler_chain_add(shared_sampler_, llama_sampler_init_top_p(params_.top_p, params_.min_keep));
+            llama_sampler_chain_add(shared_sampler_, llama_sampler_init_temp(params_.temp));
+            llama_sampler_chain_add(shared_sampler_, llama_sampler_init_dist(params_.seed));
+            llama_sampler_chain_add(shared_sampler_, llama_sampler_init_min_p(params_.min_p, params_.min_keep));
+        } else {
+            llama_sampler_chain_add(shared_sampler_, llama_sampler_init_greedy());
+        }
     } else {
-        llama_sampler_chain_add(shared_sampler_, llama_sampler_init_greedy());
+        // LLaMA not available - initialize with safe default values
+        shared_batch_ = llama_batch_init(512, 0, 1);  // Use default context size
+        shared_sampler_ = nullptr;
+        printf("Warning: LLaMA model not available. AI responses will be disabled.\n");
     }
 
     // Initialize TTS engine
@@ -399,8 +406,14 @@ bool SipClientManager::init(struct whisper_context* whisper_ctx,
         tts_manager_->init(TtsEngineFactory::EngineType::SIMPLE);
     }
 
+    // Initialize database
+    if (!database_.init()) {
+        printf("Warning: Database initialization failed\n");
+        return false;
+    }
+
     is_initialized_ = true;
-    printf("SipClientManager initialized with TTS\n");
+    printf("SipClientManager initialized with TTS and database\n");
     return true;
 }
 
@@ -551,8 +564,8 @@ std::string SipClientManager::process_with_llama(llama_seq_id seq_id, const std:
         // Format input for this sequence's conversation
         std::string formatted_input = " " + input_text + "\n" + params_.bot_name + ":";
 
-        // Tokenize the input
-        auto input_tokens = ::llama_tokenize(llama_ctx_, formatted_input, false);
+        // Tokenize the input using the helper function from talk-llama.cpp
+        auto input_tokens = llama_tokenize(llama_ctx_, formatted_input, false);
         if (input_tokens.empty()) {
             return "Sorry, I couldn't process that input.";
         }

@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper Talk LLaMA - AI Phone System Dashboard</title>
+    <link rel="stylesheet" href="dashboard.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐱</text></svg>">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">🐱</span>
+                <h1>Whisper Talk LLaMA</h1>
+                <span class="subtitle">AI Phone System Dashboard</span>
+            </div>
+            <div class="status-indicator">
+                <span id="connection-status" class="status-dot offline"></span>
+                <span id="connection-text">Connecting...</span>
+            </div>
+        </header>
+
+        <nav class="nav-tabs">
+            <button class="tab-button active" data-tab="dashboard">Dashboard</button>
+            <button class="tab-button" data-tab="sip-lines">SIP Lines</button>
+            <button class="tab-button" data-tab="models">Models</button>
+            <button class="tab-button" data-tab="settings">Settings</button>
+        </nav>
+
+        <main class="main-content">
+            <!-- Dashboard Tab -->
+            <div id="dashboard" class="tab-content active">
+                <div class="dashboard-grid">
+                    <!-- System Status -->
+                    <div class="card system-status">
+                        <h2>System Status</h2>
+                        <div class="status-grid">
+                            <div class="status-item">
+                                <span class="status-icon">🎤</span>
+                                <div class="status-info">
+                                    <h3>Whisper</h3>
+                                    <span id="whisper-status" class="status-text">Loading...</span>
+                                    <div class="status-details">
+                                        <small id="whisper-model">Model: -</small>
+                                        <small id="whisper-performance">Performance: -</small>
+                                    </div>
+                                </div>
+                                <span id="whisper-indicator" class="status-dot offline"></span>
+                            </div>
+                            
+                            <div class="status-item">
+                                <span class="status-icon">🧠</span>
+                                <div class="status-info">
+                                    <h3>LLaMA</h3>
+                                    <span id="llama-status" class="status-text">Loading...</span>
+                                    <div class="status-details">
+                                        <small id="llama-model">Model: -</small>
+                                        <small id="llama-memory">Memory: -</small>
+                                    </div>
+                                </div>
+                                <span id="llama-indicator" class="status-dot offline"></span>
+                            </div>
+                            
+                            <div class="status-item">
+                                <span class="status-icon">🔊</span>
+                                <div class="status-info">
+                                    <h3>Piper TTS</h3>
+                                    <span id="piper-status" class="status-text">Loading...</span>
+                                    <div class="status-details">
+                                        <small id="piper-voice">Voice: -</small>
+                                        <small id="piper-quality">Quality: -</small>
+                                    </div>
+                                </div>
+                                <span id="piper-indicator" class="status-dot offline"></span>
+                            </div>
+                            
+                            <div class="status-item">
+                                <span class="status-icon">📞</span>
+                                <div class="status-info">
+                                    <h3>SIP Server</h3>
+                                    <span id="sip-status" class="status-text">Loading...</span>
+                                    <div class="status-details">
+                                        <small id="sip-clients">Clients: -</small>
+                                        <small id="sip-calls">Active Calls: -</small>
+                                    </div>
+                                </div>
+                                <span id="sip-indicator" class="status-dot offline"></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Active Calls -->
+                    <div class="card active-calls">
+                        <h2>Active Calls</h2>
+                        <div id="calls-list" class="calls-list">
+                            <div class="no-calls">No active calls</div>
+                        </div>
+                    </div>
+
+                    <!-- Performance Metrics -->
+                    <div class="card performance-metrics">
+                        <h2>Performance Metrics</h2>
+                        <div class="metrics-grid">
+                            <div class="metric">
+                                <span class="metric-label">CPU Usage</span>
+                                <div class="metric-bar">
+                                    <div id="cpu-bar" class="metric-fill" style="width: 0%"></div>
+                                </div>
+                                <span id="cpu-value" class="metric-value">0%</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">Memory Usage</span>
+                                <div class="metric-bar">
+                                    <div id="memory-bar" class="metric-fill" style="width: 0%"></div>
+                                </div>
+                                <span id="memory-value" class="metric-value">0%</span>
+                            </div>
+                            <div class="metric">
+                                <span class="metric-label">GPU Usage</span>
+                                <div class="metric-bar">
+                                    <div id="gpu-bar" class="metric-fill" style="width: 0%"></div>
+                                </div>
+                                <span id="gpu-value" class="metric-value">0%</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Recent Activity -->
+                    <div class="card recent-activity">
+                        <h2>Recent Activity</h2>
+                        <div id="activity-log" class="activity-log">
+                            <div class="activity-item">
+                                <span class="activity-time">Starting up...</span>
+                                <span class="activity-message">System initializing</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- SIP Lines Tab -->
+            <div id="sip-lines" class="tab-content">
+                <div class="sip-controls">
+                    <button id="add-sip-line" class="btn btn-primary">Add SIP Line</button>
+                    <button id="refresh-sip" class="btn btn-secondary">Refresh</button>
+                </div>
+                <div id="sip-lines-list" class="sip-lines-list">
+                    <!-- SIP lines will be populated here -->
+                </div>
+            </div>
+
+            <!-- Models Tab -->
+            <div id="models" class="tab-content">
+                <div class="models-section">
+                    <h2>Model Management</h2>
+                    
+                    <!-- Current Models -->
+                    <div class="card current-models">
+                        <h3>Currently Loaded Models</h3>
+                        <div class="model-grid">
+                            <div class="model-item">
+                                <span class="model-type">Whisper</span>
+                                <span id="current-whisper-model" class="model-name">-</span>
+                                <button class="btn btn-small" onclick="changeModel('whisper')">Change</button>
+                            </div>
+                            <div class="model-item">
+                                <span class="model-type">LLaMA</span>
+                                <span id="current-llama-model" class="model-name">-</span>
+                                <button class="btn btn-small" onclick="changeModel('llama')">Change</button>
+                            </div>
+                            <div class="model-item">
+                                <span class="model-type">TTS Voice</span>
+                                <span id="current-tts-voice" class="model-name">-</span>
+                                <button class="btn btn-small" onclick="changeModel('tts')">Change</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Available Models -->
+                    <div class="card available-models">
+                        <h3>Available Models</h3>
+                        <div class="model-actions">
+                            <button id="scan-models" class="btn btn-secondary">Scan Local Models</button>
+                            <button id="download-models" class="btn btn-secondary">Download from OpenAI</button>
+                            <button id="upload-model" class="btn btn-secondary">Upload Model</button>
+                            <button id="compile-coreml" class="btn btn-primary">Compile CoreML</button>
+                        </div>
+                        <div id="models-list" class="models-list">
+                            <!-- Models will be populated here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Tab -->
+            <div id="settings" class="tab-content">
+                <div class="settings-section">
+                    <h2>System Settings</h2>
+                    <!-- Settings will be added here -->
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modal for model selection -->
+    <div id="model-modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2 id="modal-title">Select Model</h2>
+            <div id="modal-body">
+                <!-- Modal content will be populated dynamically -->
+            </div>
+        </div>
+    </div>
+
+    <script src="dashboard.js"></script>
+</body>
+</html>

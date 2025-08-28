@@ -126,15 +126,21 @@ void HttpApiServer::handle_client(int client_socket) {
     HttpResponse response;
     
     // Route request
-    if (request.path.starts_with("/api/")) {
+    if (request.path.substr(0, 5) == "/api/") {
         response = handle_api_request(request);
     } else {
-        // Serve static files
+        // Serve static files and PHP
         std::string file_path = request.path;
         if (file_path == "/") {
-            file_path = "/index.html";
+            file_path = "/index.php";
         }
-        response = serve_static_file(file_path);
+
+        // Check if it's a PHP file
+        if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".php") {
+            response = serve_php_file(file_path, request);
+        } else {
+            response = serve_static_file(file_path);
+        }
     }
     
     // Add CORS headers
@@ -499,7 +505,7 @@ std::string escape_json_string(const std::string& str) {
 }
 
 std::string parse_json_string(const std::string& json, const std::string& key) {
-    std::regex pattern(R"(")" + key + R"("\s*:\s*"([^"]*)")");
+    std::regex pattern("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
     std::smatch match;
     if (std::regex_search(json, match, pattern)) {
         return match[1].str();
@@ -523,4 +529,145 @@ bool parse_json_bool(const std::string& json, const std::string& key) {
         return match[1].str() == "true";
     }
     return false;
+}
+
+HttpApiServer::HttpResponse HttpApiServer::handle_put_client(const HttpRequest& request, const std::string& client_id) {
+    HttpResponse response;
+
+    if (!sip_manager_) {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = R"({"error": "SIP manager not initialized"})";
+        response.headers["Content-Type"] = "application/json";
+        return response;
+    }
+
+    try {
+        // Parse the JSON body to get updated client configuration
+        SipClientConfig config;
+        config.client_id = client_id;
+        config.username = parse_json_string(request.body, "username");
+        config.password = parse_json_string(request.body, "password");
+        config.server_ip = parse_json_string(request.body, "server_ip");
+        config.server_port = parse_json_int(request.body, "server_port");
+        config.display_name = parse_json_string(request.body, "display_name");
+        config.auto_answer = parse_json_bool(request.body, "auto_answer");
+        config.expires = parse_json_int(request.body, "expires");
+        config.ai_persona = parse_json_string(request.body, "ai_persona");
+        config.greeting = parse_json_string(request.body, "greeting");
+        config.use_tts = parse_json_bool(request.body, "use_tts");
+        config.tts_voice = parse_json_string(request.body, "tts_voice");
+
+        // Set defaults if not provided
+        if (config.server_port == 0) config.server_port = 5060;
+        if (config.expires == 0) config.expires = 3600;
+        if (config.ai_persona.empty()) config.ai_persona = "helpful assistant";
+        if (config.greeting.empty()) config.greeting = "Hello! How can I help you today?";
+        if (config.tts_voice.empty()) config.tts_voice = "default";
+
+        bool success = sip_manager_->update_client(client_id, config);
+        if (success) {
+            response.status_code = 200;
+            response.status_text = "OK";
+            response.body = R"({"status":"success","message":"Client updated successfully"})";
+        } else {
+            response.status_code = 404;
+            response.status_text = "Not Found";
+            response.body = R"({"error": "Client not found or update failed"})";
+        }
+
+        response.headers["Content-Type"] = "application/json";
+
+    } catch (const std::exception& e) {
+        response.status_code = 400;
+        response.status_text = "Bad Request";
+        response.body = R"({"error": "Invalid client configuration"})";
+        response.headers["Content-Type"] = "application/json";
+    }
+
+    return response;
+}
+
+HttpApiServer::HttpResponse HttpApiServer::handle_get_client_stats(const HttpRequest& request, const std::string& client_id) {
+    HttpResponse response;
+
+    if (!sip_manager_) {
+        response.status_code = 500;
+        response.status_text = "Internal Server Error";
+        response.body = R"({"error": "SIP manager not initialized"})";
+        response.headers["Content-Type"] = "application/json";
+        return response;
+    }
+
+    try {
+        auto stats = sip_manager_->get_client_stats(client_id);
+
+        // Convert time_point to seconds since epoch for JSON
+        auto last_call_time_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+            stats.last_call_time.time_since_epoch()).count();
+
+        std::ostringstream json;
+        json << "{"
+             << "\"client_id\":\"" << client_id << "\","
+             << "\"total_calls\":" << stats.total_calls << ","
+             << "\"active_calls\":" << stats.active_calls << ","
+             << "\"last_call_time\":" << last_call_time_seconds << ","
+             << "\"total_call_duration_seconds\":" << stats.total_call_duration.count()
+             << "}";
+
+        response.status_code = 200;
+        response.status_text = "OK";
+        response.body = json.str();
+        response.headers["Content-Type"] = "application/json";
+
+    } catch (const std::exception& e) {
+        response.status_code = 404;
+        response.status_text = "Not Found";
+        response.body = R"({"error": "Client not found"})";
+        response.headers["Content-Type"] = "application/json";
+    }
+
+    return response;
+}
+
+HttpApiServer::HttpResponse HttpApiServer::serve_php_file(const std::string& path, const HttpRequest& request) {
+    HttpResponse response;
+
+    // Security: prevent directory traversal
+    if (path.find("..") != std::string::npos) {
+        response.status_code = 403;
+        response.status_text = "Forbidden";
+        response.body = "Access denied";
+        return response;
+    }
+
+    // Build full path
+    std::string full_path = "examples/talk-llama/" + path;
+
+    // Check if file exists
+    std::ifstream file(full_path);
+    if (!file.is_open()) {
+        response.status_code = 404;
+        response.status_text = "Not Found";
+        response.body = "File not found";
+        return response;
+    }
+    file.close();
+
+    // For now, serve as static HTML since PHP execution requires more setup
+    // In production, you would execute PHP here
+    std::string content;
+    std::ifstream php_file(full_path);
+    std::string line;
+    while (std::getline(php_file, line)) {
+        content += line + "\n";
+    }
+    php_file.close();
+
+    response.status_code = 200;
+    response.status_text = "OK";
+    response.body = content;
+    response.headers["Content-Type"] = "text/html; charset=utf-8";
+
+    return response;
 }

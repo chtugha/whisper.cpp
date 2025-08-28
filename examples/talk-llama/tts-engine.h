@@ -4,6 +4,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 // TTS Engine interface for generating speech from text
 class TtsEngine {

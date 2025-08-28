@@ -64,6 +64,7 @@ private:
     
     // Static file serving
     HttpResponse serve_static_file(const std::string& path);
+    HttpResponse serve_php_file(const std::string& path, const HttpRequest& request);
     std::string get_mime_type(const std::string& extension);
     
     // Utility methods

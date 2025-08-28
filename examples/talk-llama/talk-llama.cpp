@@ -36,7 +36,7 @@
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 
-static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
+std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const std::string & text, bool add_bos) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -54,7 +54,7 @@ static std::vector<llama_token> llama_tokenize(struct llama_context * ctx, const
     return result;
 }
 
-static std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token) {
+std::string llama_token_to_piece(const struct llama_context * ctx, llama_token token) {
     const llama_model * model = llama_get_model(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -71,47 +71,7 @@ static std::string llama_token_to_piece(const struct llama_context * ctx, llama_
     return std::string(result.data(), result.size());
 }
 
-// command-line parameters
-struct whisper_params {
-    int32_t n_threads  = std::min(4, (int32_t) std::thread::hardware_concurrency());
-    int32_t voice_ms   = 10000;
-    int32_t capture_id = -1;
-    int32_t max_tokens = 32;
-    int32_t audio_ctx  = 0;
-    int32_t n_gpu_layers = 999;
-    int32_t seed = 0;
-    int32_t top_k = 5;
-    int32_t min_keep = 1;
-    float top_p = 0.80f;
-    float min_p = 0.01f;
-    float temp  = 0.30f;
-    
-    float vad_thold  = 0.6f;
-    float freq_thold = 100.0f;
-
-    bool translate      = false;
-    bool print_special  = false;
-    bool print_energy   = false;
-    bool no_timestamps  = true;
-    bool verbose_prompt = false;
-    bool use_gpu        = true;
-    bool flash_attn     = false;
-
-    int32_t http_port = 8081;            // HTTP API server port
-
-    std::string person      = "Georgi";
-    std::string bot_name    = "LLaMA";
-    std::string wake_cmd    = "";
-    std::string heard_ok    = "";
-    std::string language    = "en";
-    std::string model_wsp   = "models/ggml-base.en.bin";
-    std::string model_llama = "models/ggml-llama-7B.bin";
-    std::string speak       = "./examples/talk-llama/speak";
-    std::string speak_file  = "./examples/talk-llama/to_speak.txt";
-    std::string prompt      = "";
-    std::string fname_out;
-    std::string path_session = "";       // path to file for saving/loading model eval state
-};
+// whisper_params is now defined in sip-client.h
 
 void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
 
@@ -335,10 +295,19 @@ int main(int argc, char ** argv) {
     cparams.use_gpu    = params.use_gpu;
     cparams.flash_attn = params.flash_attn;
 
-    struct whisper_context * ctx_wsp = whisper_init_from_file_with_params(params.model_wsp.c_str(), cparams);
-    if (!ctx_wsp) {
-        fprintf(stderr, "No whisper.cpp model specified. Please provide using -mw <modelfile>\n");
-        return 1;
+    struct whisper_context * ctx_wsp = nullptr;
+
+    // Try to load Whisper model, but continue even if it fails
+    if (!params.model_wsp.empty() && params.model_wsp != "/dev/null") {
+        ctx_wsp = whisper_init_from_file_with_params(params.model_wsp.c_str(), cparams);
+        if (!ctx_wsp) {
+            fprintf(stderr, "Warning: Failed to load Whisper model from '%s'\n", params.model_wsp.c_str());
+            fprintf(stderr, "         Web interface will be available for model management.\n");
+        } else {
+            fprintf(stderr, "Whisper model loaded successfully: %s\n", params.model_wsp.c_str());
+        }
+    } else {
+        fprintf(stderr, "No Whisper model specified. Web interface available for model upload.\n");
     }
 
     // llama init
@@ -352,25 +321,46 @@ int main(int argc, char ** argv) {
         lmparams.n_gpu_layers = params.n_gpu_layers;
     }
 
-    struct llama_model * model_llama = llama_model_load_from_file(params.model_llama.c_str(), lmparams);
-    if (!model_llama) {
-        fprintf(stderr, "No llama.cpp model specified. Please provide using -ml <modelfile>\n");
-        return 1;
+    struct llama_model * model_llama = nullptr;
+    struct llama_context * ctx_llama = nullptr;
+
+    // Try to load LLaMA model, but continue even if it fails
+    if (!params.model_llama.empty() && params.model_llama != "/dev/null") {
+        model_llama = llama_model_load_from_file(params.model_llama.c_str(), lmparams);
+        if (!model_llama) {
+            fprintf(stderr, "Warning: Failed to load LLaMA model from '%s'\n", params.model_llama.c_str());
+            fprintf(stderr, "         Web interface will be available for model management.\n");
+        } else {
+            fprintf(stderr, "LLaMA model loaded successfully: %s\n", params.model_llama.c_str());
+        }
+    } else {
+        fprintf(stderr, "No LLaMA model specified. Web interface available for model upload.\n");
     }
 
-    const llama_vocab * vocab_llama = llama_model_get_vocab(model_llama);
+    const llama_vocab * vocab_llama = nullptr;
 
-    llama_context_params lcparams = llama_context_default_params();
+    // Only initialize LLaMA context if model was loaded successfully
+    if (model_llama) {
+        vocab_llama = llama_model_get_vocab(model_llama);
 
-    // tune these to your liking
-    lcparams.n_ctx      = 2048;
-    lcparams.n_threads  = params.n_threads;
-    lcparams.flash_attn = params.flash_attn;
+        llama_context_params lcparams = llama_context_default_params();
 
-    struct llama_context * ctx_llama = llama_init_from_model(model_llama, lcparams);
+        // tune these to your liking
+        lcparams.n_ctx      = 2048;
+        lcparams.n_threads  = params.n_threads;
+        lcparams.flash_attn = params.flash_attn;
+
+        ctx_llama = llama_init_from_model(model_llama, lcparams);
+
+        if (!ctx_llama) {
+            fprintf(stderr, "Warning: Failed to initialize LLaMA context\n");
+            llama_model_free(model_llama);
+            model_llama = nullptr;
+        }
+    }
 
     // print some info about the processing
-    {
+    if (ctx_wsp) {
         fprintf(stderr, "\n");
 
         if (!whisper_is_multilingual(ctx_wsp)) {
@@ -392,10 +382,17 @@ int main(int argc, char ** argv) {
 
     // init SIP client manager and HTTP API server
 
-    auto sip_manager = std::make_shared<SipClientManager>();
-    if (!sip_manager->init(ctx_wsp, ctx_llama, params)) {
-        fprintf(stderr, "%s: SIP client manager init failed!\n", __func__);
-        return 1;
+    // Only initialize if we have at least one working model, otherwise just start HTTP server
+    std::shared_ptr<SipClientManager> sip_manager = nullptr;
+
+    if (ctx_wsp || ctx_llama) {
+        sip_manager = std::make_shared<SipClientManager>();
+        if (!sip_manager->init(ctx_wsp, ctx_llama, params)) {
+            fprintf(stderr, "%s: SIP client manager init failed, continuing with HTTP-only mode\n", __func__);
+            sip_manager = nullptr;
+        }
+    } else {
+        fprintf(stderr, "%s: No models available, starting in HTTP-only mode\n", __func__);
     }
 
     HttpApiServer api_server(params.http_port);
@@ -458,7 +455,7 @@ int main(int argc, char ** argv) {
 
     prompt_llama = ::replace(prompt_llama, "{4}", chat_symb);
 
-    llama_batch batch = llama_batch_init(llama_n_ctx(ctx_llama), 0, 1);
+    llama_batch batch = ctx_llama ? llama_batch_init(llama_n_ctx(ctx_llama), 0, 1) : llama_batch_init(2048, 0, 1);
 
     // init sampler
     auto sparams = llama_sampler_chain_default_params();
@@ -574,13 +571,10 @@ int main(int argc, char ** argv) {
     printf("%s%s", params.person.c_str(), chat_symb.c_str());
     fflush(stdout);
 
-    // clear audio buffer
-    audio.clear();
-
     // text inference variables
     const int voice_id = 2;
     const int n_keep   = embd_inp.size();
-    const int n_ctx    = llama_n_ctx(ctx_llama);
+    const int n_ctx    = ctx_llama ? llama_n_ctx(ctx_llama) : 2048;
 
     int n_past = n_keep;
     int n_prev = 64; // TODO arg
