@@ -1,93 +1,42 @@
 #include "whisper-connector.h"
+#include "whisper-service.h"
 #include <iostream>
 #include <chrono>
-#include <curl/curl.h>
-#include <cstring>
 
-// Helper function for HTTP response handling
-static size_t write_callback(void* contents, size_t size, size_t nmemb, std::string* userp) {
-    size_t total_size = size * nmemb;
-    userp->append((char*)contents, total_size);
-    return total_size;
-}
+// HTTP helper functions removed - using direct interface now
 
-// Helper function to convert float audio to WAV format
-static std::vector<uint8_t> convert_to_wav(const std::vector<float>& audio_data) {
-    std::vector<uint8_t> wav_data;
-
-    // WAV header (44 bytes)
-    const int sample_rate = 16000;
-    const int channels = 1;
-    const int bits_per_sample = 16;
-    const int data_size = audio_data.size() * sizeof(int16_t);
-    const int file_size = 36 + data_size;
-
-    // RIFF header
-    wav_data.insert(wav_data.end(), {'R', 'I', 'F', 'F'});
-    wav_data.insert(wav_data.end(), (uint8_t*)&file_size, (uint8_t*)&file_size + 4);
-    wav_data.insert(wav_data.end(), {'W', 'A', 'V', 'E'});
-
-    // fmt chunk
-    wav_data.insert(wav_data.end(), {'f', 'm', 't', ' '});
-    int fmt_size = 16;
-    wav_data.insert(wav_data.end(), (uint8_t*)&fmt_size, (uint8_t*)&fmt_size + 4);
-    int16_t format = 1; // PCM
-    wav_data.insert(wav_data.end(), (uint8_t*)&format, (uint8_t*)&format + 2);
-    int16_t num_channels = channels;
-    wav_data.insert(wav_data.end(), (uint8_t*)&num_channels, (uint8_t*)&num_channels + 2);
-    wav_data.insert(wav_data.end(), (uint8_t*)&sample_rate, (uint8_t*)&sample_rate + 4);
-    int byte_rate = sample_rate * channels * bits_per_sample / 8;
-    wav_data.insert(wav_data.end(), (uint8_t*)&byte_rate, (uint8_t*)&byte_rate + 4);
-    int16_t block_align = channels * bits_per_sample / 8;
-    wav_data.insert(wav_data.end(), (uint8_t*)&block_align, (uint8_t*)&block_align + 2);
-    int16_t bits = bits_per_sample;
-    wav_data.insert(wav_data.end(), (uint8_t*)&bits, (uint8_t*)&bits + 2);
-
-    // data chunk
-    wav_data.insert(wav_data.end(), {'d', 'a', 't', 'a'});
-    wav_data.insert(wav_data.end(), (uint8_t*)&data_size, (uint8_t*)&data_size + 4);
-
-    // Convert float samples to 16-bit PCM
-    for (float sample : audio_data) {
-        int16_t pcm_sample = (int16_t)(sample * 32767.0f);
-        wav_data.insert(wav_data.end(), (uint8_t*)&pcm_sample, (uint8_t*)&pcm_sample + 2);
-    }
-
-    return wav_data;
-}
-
-// WhisperConnector Implementation
-WhisperConnector::WhisperConnector() : running_(false), connected_(false) {}
+// WhisperConnector Implementation - Direct Interface
+WhisperConnector::WhisperConnector() : running_(false), connected_(false), whisper_service_(nullptr) {}
 
 WhisperConnector::~WhisperConnector() {
     stop();
 }
 
-bool WhisperConnector::start(const std::string& whisper_endpoint) {
+bool WhisperConnector::start(WhisperService* whisper_service) {
     if (running_.load()) return true;
-    
-    whisper_endpoint_ = whisper_endpoint;
+
+    whisper_service_ = whisper_service;
     running_.store(true);
-    
+
+    // Check initial connection status
+    connected_.store(whisper_service_ && whisper_service_->is_model_loaded());
+
     // Start background worker
     worker_thread_ = std::thread(&WhisperConnector::worker_loop, this);
-    
-    // Start connection monitor
-    connection_monitor_thread_ = std::thread(&WhisperConnector::connection_monitor_loop, this);
-    
-    std::cout << "🔗 WhisperConnector started, endpoint: " << whisper_endpoint_ << std::endl;
+
+    std::cout << "🔗 WhisperConnector started with direct interface" << std::endl;
+    std::cout << "📊 Initial connection status: " << (connected_.load() ? "connected" : "disconnected") << std::endl;
     return true;
 }
 
 void WhisperConnector::stop() {
     if (!running_.load()) return;
-    
+
     running_.store(false);
     queue_cv_.notify_all();
-    
+
     if (worker_thread_.joinable()) worker_thread_.join();
-    if (connection_monitor_thread_.joinable()) connection_monitor_thread_.join();
-    
+
     std::cout << "🔗 WhisperConnector stopped" << std::endl;
 }
 
@@ -106,53 +55,27 @@ void WhisperConnector::send_chunk(const std::string& session_id, const std::vect
 }
 
 std::string WhisperConnector::transcribe_chunk(const std::string& session_id, const std::vector<float>& audio_chunk) {
-    if (!connected_.load()) {
+    if (!connected_.load() || !whisper_service_) {
         std::cout << "⚠️  Whisper service not connected" << std::endl;
         return "";
     }
 
     std::cout << "📤 Transcribing " << audio_chunk.size() << " samples for session: " << session_id << std::endl;
 
-    CURL* curl = curl_easy_init();
-    if (!curl) return "";
+    // Direct function call - no HTTP overhead!
+    try {
+        std::string transcription = whisper_service_->transcribe_chunk(session_id, audio_chunk);
 
-    // Convert audio to WAV format
-    std::vector<uint8_t> wav_data = convert_to_wav(audio_chunk);
-
-    // Prepare HTTP request
-    std::string response_data;
-    std::string url = whisper_endpoint_ + "/api/whisper/transcribe";
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_POST, 1L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-
-    // Set headers
-    struct curl_slist* headers = nullptr;
-    headers = curl_slist_append(headers, "Content-Type: audio/wav");
-    std::string session_header = "X-Session-ID: " + session_id;
-    headers = curl_slist_append(headers, session_header.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-    // Set audio data
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, wav_data.data());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, wav_data.size());
-
-    // Perform request
-    CURLcode res = curl_easy_perform(curl);
-    long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-
-    if (res == CURLE_OK && response_code == 200) {
-        std::cout << "✅ Whisper transcription received: \"" << response_data << "\"" << std::endl;
-        return response_data;
-    } else {
-        std::cout << "❌ Whisper transcription failed: " << res << " (HTTP " << response_code << ")" << std::endl;
+        if (!transcription.empty()) {
+            std::cout << "✅ Whisper transcription received: \"" << transcription << "\"" << std::endl;
+            return transcription;
+        } else {
+            std::cout << "⚠️  Empty transcription received" << std::endl;
+            return "";
+        }
+    } catch (const std::exception& e) {
+        std::cout << "❌ Whisper transcription failed: " << e.what() << std::endl;
+        connected_.store(false);  // Mark as disconnected on error
         return "";
     }
 }
@@ -169,97 +92,31 @@ void WhisperConnector::worker_loop() {
             chunk_queue_.pop();
             lock.unlock();
             
-            // Send to Whisper service
-            send_chunk_to_whisper(chunk.session_id, chunk.audio_data);
+            // Send to Whisper service via direct call
+            transcribe_chunk(chunk.session_id, chunk.audio_data);
         }
     }
 }
 
-void WhisperConnector::connection_monitor_loop() {
-    while (running_.load()) {
-        bool was_connected = connected_.load();
-        bool is_connected = check_whisper_connection();
-        
-        if (was_connected != is_connected) {
-            connected_.store(is_connected);
-            if (connection_callback_) {
-                connection_callback_(is_connected);
-            }
-            std::cout << "🔗 Whisper connection: " << (is_connected ? "CONNECTED" : "DISCONNECTED") << std::endl;
-        }
-        
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-    }
-}
+// Connection monitoring removed - using direct interface with immediate status checking
+
+// Direct interface methods - no HTTP overhead
 
 bool WhisperConnector::check_whisper_connection() {
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-
-    // Simple health check to Whisper service
-    std::string health_url = whisper_endpoint_ + "/health";
-    curl_easy_setopt(curl, CURLOPT_URL, health_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, [](void*, size_t, size_t, void*) -> size_t { return 0; });
-
-    CURLcode res = curl_easy_perform(curl);
-    long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-    curl_easy_cleanup(curl);
-
-    return (res == CURLE_OK && response_code == 200);
+    // Direct connection check - no HTTP needed
+    return whisper_service_ && whisper_service_->is_model_loaded();
 }
 
-bool WhisperConnector::send_chunk_to_whisper(const std::string& session_id, const std::vector<float>& audio_data) {
-    std::cout << "📤 Sending " << audio_data.size() << " samples to Whisper for session: " << session_id << std::endl;
+void WhisperConnector::update_connection_status() {
+    bool new_status = check_whisper_connection();
+    bool old_status = connected_.load();
 
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-
-    // Convert float audio to WAV format for Whisper
-    std::vector<uint8_t> wav_data = ::convert_to_wav(audio_data);
-
-    // Prepare HTTP POST to Whisper service
-    std::string transcribe_url = whisper_endpoint_ + "/api/whisper/transcribe";
-
-    // Create multipart form data
-    curl_mime* form = curl_mime_init(curl);
-    curl_mimepart* field;
-
-    // Add session_id field
-    field = curl_mime_addpart(form);
-    curl_mime_name(field, "session_id");
-    curl_mime_data(field, session_id.c_str(), CURL_ZERO_TERMINATED);
-
-    // Add audio file field
-    field = curl_mime_addpart(form);
-    curl_mime_name(field, "audio");
-    curl_mime_filename(field, "audio.wav");
-    curl_mime_type(field, "audio/wav");
-    curl_mime_data(field, (char*)wav_data.data(), wav_data.size());
-
-    // Set up response handling
-    std::string response_data;
-    curl_easy_setopt(curl, CURLOPT_URL, transcribe_url.c_str());
-    curl_easy_setopt(curl, CURLOPT_MIMEPOST, form);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-
-    // Send request
-    CURLcode res = curl_easy_perform(curl);
-    long response_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
-
-    curl_mime_free(form);
-    curl_easy_cleanup(curl);
-
-    if (res == CURLE_OK && response_code == 200) {
-        std::cout << "✅ Whisper transcription response: " << response_data << std::endl;
-        return true;
-    } else {
-        std::cout << "❌ Whisper request failed: " << res << " (HTTP " << response_code << ")" << std::endl;
-        return false;
+    if (new_status != old_status) {
+        connected_.store(new_status);
+        if (connection_callback_) {
+            connection_callback_(new_status);
+        }
+        std::cout << "🔗 Whisper connection: " << (new_status ? "CONNECTED" : "DISCONNECTED") << std::endl;
     }
 }
 

@@ -25,7 +25,8 @@ void AudioProcessorService::ServiceAudioInterface::on_audio_chunk_ready(const st
 // AudioProcessorService Implementation
 AudioProcessorService::AudioProcessorService()
     : running_(false), active_(false), service_port_(8083), database_(nullptr),
-      whisper_endpoint_("http://localhost:8082"), total_packets_processed_(0), active_sessions_(0) {
+      whisper_endpoint_("http://localhost:8082"), whisper_service_(nullptr),
+      total_packets_processed_(0), active_sessions_(0) {
     
     // Create audio interface
     audio_interface_ = std::make_unique<ServiceAudioInterface>(this);
@@ -263,7 +264,12 @@ void AudioProcessorService::activate_for_call() {
         // Start background connectors
         if (!whisper_connector_) {
             whisper_connector_ = std::make_unique<WhisperConnector>();
-            whisper_connector_->start(whisper_endpoint_);
+            if (whisper_service_) {
+                whisper_connector_->start(whisper_service_);
+                std::cout << "🔗 WhisperConnector using direct interface" << std::endl;
+            } else {
+                std::cout << "⚠️  No WhisperService available - audio will be dropped" << std::endl;
+            }
         }
 
         if (!piper_connector_) {

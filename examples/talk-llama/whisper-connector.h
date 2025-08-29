@@ -11,18 +11,21 @@
 #include "jitter-buffer.h"
 #include "rtp-packet.h"
 
-// Background mechanism for routing chunks to Whisper service
+// Forward declaration
+class WhisperService;
+
+// Direct interface for routing chunks to Whisper service (no HTTP overhead)
 class WhisperConnector {
 public:
     WhisperConnector();
     ~WhisperConnector();
-    
-    // Connection management
-    bool start(const std::string& whisper_endpoint);
+
+    // Connection management - now uses direct service reference
+    bool start(WhisperService* whisper_service);
     void stop();
     bool is_connected() const { return connected_.load(); }
-    
-    // Audio chunk routing
+
+    // Audio chunk routing - direct function calls
     void send_chunk(const std::string& session_id, const std::vector<float>& audio_chunk);
     std::string transcribe_chunk(const std::string& session_id, const std::vector<float>& audio_chunk);
 
@@ -34,26 +37,24 @@ private:
         std::string session_id;
         std::vector<float> audio_data;
     };
-    
+
     std::atomic<bool> running_;
     std::atomic<bool> connected_;
-    std::string whisper_endpoint_;
-    
+    WhisperService* whisper_service_;  // Direct reference instead of HTTP endpoint
+
     // Background processing
     std::thread worker_thread_;
     std::queue<AudioChunk> chunk_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
-    
+
     // Connection monitoring
     std::function<void(bool)> connection_callback_;
-    std::thread connection_monitor_thread_;
     
     // Background mechanisms
     void worker_loop();
-    void connection_monitor_loop();
     bool check_whisper_connection();
-    bool send_chunk_to_whisper(const std::string& session_id, const std::vector<float>& audio_data);
+    void update_connection_status();
 };
 
 // Background mechanism for routing Piper audio to RTP

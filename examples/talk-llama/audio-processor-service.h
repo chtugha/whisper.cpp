@@ -12,6 +12,9 @@
 #include <functional>
 #include <unordered_map>
 
+// Forward declarations
+class WhisperService;
+
 // Standalone Audio Processor Service
 // Runs independently, SIP client connects to it via interface
 class AudioProcessorService {
@@ -32,6 +35,7 @@ public:
     // Configuration
     void set_database(Database* database);
     void set_whisper_endpoint(const std::string& endpoint) { whisper_endpoint_ = endpoint; }
+    void set_whisper_service(WhisperService* whisper_service) { whisper_service_ = whisper_service; }
     
     // Audio processing interface for SIP clients
     bool create_session(const AudioSessionParams& params);
@@ -81,6 +85,7 @@ private:
     // Configuration
     Database* database_;
     std::string whisper_endpoint_;
+    WhisperService* whisper_service_;  // Direct reference for zero-overhead access
     
     // Statistics
     std::atomic<size_t> total_packets_processed_;

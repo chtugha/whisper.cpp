@@ -623,12 +623,8 @@ HttpResponse SimpleHttpServer::handle_api_request(const HttpRequest& request) {
         if (request.method == "POST") {
             return api_whisper_stop(request);
         }
-    } else if (request.path == "/api/whisper/transcribe") {
-        std::cout << "Matched whisper transcribe endpoint" << std::endl;
-        if (request.method == "POST") {
-            return api_whisper_transcribe(request);
-        }
     }
+    // Note: /api/whisper/transcribe removed - using direct interface now
 
     // Debug: log unmatched requests
     std::cout << "UNMATCHED API request: " << request.method << " " << request.path << std::endl;
@@ -1317,87 +1313,4 @@ HttpResponse SimpleHttpServer::api_whisper_stop(const HttpRequest& request) {
     return response;
 }
 
-HttpResponse SimpleHttpServer::api_whisper_transcribe(const HttpRequest& request) {
-    HttpResponse response;
-    response.headers["Content-Type"] = "application/json";
-
-    if (!whisper_service_) {
-        response.status_code = 503;
-        response.status_text = "Service Unavailable";
-        response.body = "{\"error\": \"Whisper service not available\"}";
-        return response;
-    }
-
-    if (!whisper_service_->is_model_loaded()) {
-        response.status_code = 503;
-        response.status_text = "Service Unavailable";
-        response.body = "{\"error\": \"No Whisper model loaded\"}";
-        return response;
-    }
-
-    // Get session ID from headers
-    std::string session_id = "default";
-    auto session_header = request.headers.find("X-Session-ID");
-    if (session_header != request.headers.end()) {
-        session_id = session_header->second;
-    }
-
-    // Ensure session exists
-    if (!whisper_service_->has_session(session_id)) {
-        if (!whisper_service_->init_session(session_id)) {
-            response.status_code = 500;
-            response.status_text = "Internal Server Error";
-            response.body = "{\"error\": \"Failed to initialize session\"}";
-            return response;
-        }
-    }
-
-    // Parse WAV audio data from request body
-    if (request.body.empty()) {
-        response.status_code = 400;
-        response.status_text = "Bad Request";
-        response.body = "{\"error\": \"No audio data provided\"}";
-        return response;
-    }
-
-    // Convert WAV data to float samples (simplified - assumes 16kHz mono WAV)
-    std::vector<float> audio_samples;
-
-    // Skip WAV header (44 bytes) and convert 16-bit PCM to float
-    if (request.body.size() > 44) {
-        const uint8_t* pcm_data = reinterpret_cast<const uint8_t*>(request.body.data() + 44);
-        size_t pcm_size = request.body.size() - 44;
-
-        audio_samples.reserve(pcm_size / 2);
-        for (size_t i = 0; i < pcm_size; i += 2) {
-            int16_t sample = static_cast<int16_t>(pcm_data[i] | (pcm_data[i + 1] << 8));
-            audio_samples.push_back(static_cast<float>(sample) / 32768.0f);
-        }
-    }
-
-    if (audio_samples.empty()) {
-        response.status_code = 400;
-        response.status_text = "Bad Request";
-        response.body = "{\"error\": \"Invalid audio data\"}";
-        return response;
-    }
-
-    std::cout << "🎤 Transcribing " << audio_samples.size() << " samples for session: " << session_id << std::endl;
-
-    // Transcribe using WhisperService
-    std::string transcription = whisper_service_->transcribe_chunk(session_id, audio_samples);
-
-    if (transcription.empty()) {
-        response.status_code = 500;
-        response.status_text = "Internal Server Error";
-        response.body = "{\"error\": \"Transcription failed\"}";
-        return response;
-    }
-
-    response.status_code = 200;
-    response.status_text = "OK";
-    response.body = transcription;  // Return plain text transcription
-
-    std::cout << "✅ Transcription completed: \"" << transcription << "\"" << std::endl;
-    return response;
-}
+// api_whisper_transcribe method removed - using direct interface now
